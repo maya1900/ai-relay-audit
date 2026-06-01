@@ -1,0 +1,6 @@
+# AI Relay Audit 仅使用 Python 标准库，核心功能无需任何第三方依赖。
+# 运行环境：Python >= 3.10（使用了 `X | Y`、`tuple[...]` 等类型注解语法）。
+#
+# 唯一的可选依赖：在 Windows 上启用 TUI 需要 curses 兼容层。
+# macOS / Linux 自带 curses，下面这行因平台标记不匹配不会被安装。
+windows-curses; sys_platform == "win32"
