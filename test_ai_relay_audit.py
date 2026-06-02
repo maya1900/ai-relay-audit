@@ -385,6 +385,42 @@ class FilterModelsTest(unittest.TestCase):
 
 
 class RunEstimateTest(unittest.TestCase):
+    def test_pricing_matches_known_standard_models(self) -> None:
+        codex = m.pricing_for_model("gpt-5.3-codex")
+        self.assertIsNotNone(codex)
+        self.assertEqual(codex.label, "GPT-5.3-Codex")
+        self.assertEqual(codex.input_per_million, 1.75)
+        self.assertEqual(codex.output_per_million, 14.0)
+
+        gpt_54 = m.pricing_for_model("gpt-5.4")
+        self.assertIsNotNone(gpt_54)
+        self.assertEqual(gpt_54.label, "GPT-5.4")
+        self.assertEqual(gpt_54.input_per_million, 2.5)
+        self.assertEqual(gpt_54.output_per_million, 15.0)
+
+        gpt_54_mini = m.pricing_for_model("gpt-5.4-mini")
+        self.assertIsNotNone(gpt_54_mini)
+        self.assertEqual(gpt_54_mini.label, "GPT-5.4 mini")
+        self.assertEqual(gpt_54_mini.input_per_million, 0.75)
+        self.assertEqual(gpt_54_mini.output_per_million, 4.5)
+
+        gpt_55 = m.pricing_for_model("gpt-5.5")
+        self.assertIsNotNone(gpt_55)
+        self.assertEqual(gpt_55.label, "GPT-5.5")
+        self.assertEqual(gpt_55.input_per_million, 5.0)
+        self.assertEqual(gpt_55.output_per_million, 30.0)
+
+        opus_45 = m.pricing_for_model("claude-opus-4-5-20251101")
+        self.assertIsNotNone(opus_45)
+        self.assertEqual(opus_45.label, "Claude Opus 4.5+")
+        self.assertEqual(opus_45.input_per_million, 5.0)
+        self.assertEqual(opus_45.output_per_million, 25.0)
+
+    def test_pricing_does_not_guess_different_variants(self) -> None:
+        self.assertIsNone(m.pricing_for_model("gpt-5-pro"))
+        self.assertIsNone(m.pricing_for_model("gpt-5-mini"))
+        self.assertIsNone(m.pricing_for_model("o3-mini"))
+
     def test_counts_family_specific_probes(self) -> None:
         cfg = m.AuditConfig(make_config(), ["gpt-4o", "claude-3-haiku"], None, None, False, False, "reports", True)
         estimate = m.build_run_estimate(cfg, cfg.models)
@@ -398,6 +434,17 @@ class RunEstimateTest(unittest.TestCase):
         estimate = m.build_run_estimate(cfg, cfg.models)
         self.assertEqual(estimate.probes_by_model["llama-3"], 9)
         self.assertEqual(estimate.max_output_tokens, 9 * cfg.api.max_tokens)
+
+    def test_known_price_estimate_uses_output_upper_bound(self) -> None:
+        cfg = m.AuditConfig(make_config(), ["gpt-5.5"], None, None, False, False, "reports", False)
+        estimate = m.build_run_estimate(cfg, cfg.models)
+        item = estimate.cost_by_model["gpt-5.5"]
+        self.assertEqual(item.pricing_label, "GPT-5.5")
+        self.assertEqual(item.output_tokens, 7 * m.reasoning_token_budget(cfg.api))
+        self.assertIsNotNone(item.total_cost)
+
+        lines = m.format_run_estimate(estimate)
+        self.assertTrue(any("Estimated official cost upper bound:" in line for line in lines))
 
 
 class DecisionSummaryTest(unittest.TestCase):
