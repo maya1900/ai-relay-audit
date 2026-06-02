@@ -126,6 +126,17 @@ class ProbeResult:
     response_data: dict[str, Any] | None = None  # 完整响应体，用于 thinking signature 等高级检测
 
 
+@dataclasses.dataclass
+class SevereIssue:
+    """严重问题记录。"""
+    probe_id: str
+    probe_title: str
+    severity: str  # "critical", "high", "medium"
+    score: float
+    reason: str
+    icon: str  # "🔴", "🟠", "🟡"
+
+
 @dataclasses.dataclass(frozen=True)
 class ModelPricing:
     label: str
@@ -1736,6 +1747,82 @@ def availability_summary(results: list[ProbeResult]) -> tuple[int, int, str]:
     return errors, total, "接口可用：所有检测请求均完成。"
 
 
+def detect_severe_issues(model: str, results: list[ProbeResult]) -> list[SevereIssue]:
+    """检测严重问题并分类。
+
+    返回按严重性排序的问题列表：critical > high > medium
+    """
+    issues: list[SevereIssue] = []
+    family = family_for_model(model)
+
+    for result in results:
+        if result.status != "ok":
+            continue
+
+        # 1. 协议指纹异常 - Critical
+        if result.probe.probe_id == "protocol_fingerprint" and result.score < 30:
+            issues.append(SevereIssue(
+                probe_id=result.probe.probe_id,
+                probe_title=result.probe.title,
+                severity="critical",
+                score=result.score,
+                reason=result.reason,
+                icon="🔴"
+            ))
+
+        # 2. Thinking signature 缺失（Claude 模型）- Critical
+        elif result.probe.probe_id == "claude_thinking_signature" and result.score < 50:
+            issues.append(SevereIssue(
+                probe_id=result.probe.probe_id,
+                probe_title=result.probe.title,
+                severity="critical",
+                score=result.score,
+                reason=result.reason,
+                icon="🔴"
+            ))
+
+        # 3. Stream 严重不一致 - High
+        elif result.probe.probe_id == "stream_consistency" and result.score < 50:
+            # 只有在两者都存在但不一致时才标记为严重（50 分表示一方缺失）
+            if "严重不一致" in result.reason or "篡改" in result.reason:
+                issues.append(SevereIssue(
+                    probe_id=result.probe.probe_id,
+                    probe_title=result.probe.title,
+                    severity="high",
+                    score=result.score,
+                    reason=result.reason,
+                    icon="🟠"
+                ))
+
+        # 4. 身份混乱 - Medium
+        elif result.probe.probe_id == "identity_limits" and result.score < 40:
+            issues.append(SevereIssue(
+                probe_id=result.probe.probe_id,
+                probe_title=result.probe.title,
+                severity="medium",
+                score=result.score,
+                reason=result.reason,
+                icon="🟡"
+            ))
+
+        # 5. 高权重探针极低分 - Medium
+        elif result.probe.weight >= 15 and result.score < 30:
+            issues.append(SevereIssue(
+                probe_id=result.probe.probe_id,
+                probe_title=result.probe.title,
+                severity="medium",
+                score=result.score,
+                reason=result.reason,
+                icon="🟡"
+            ))
+
+    # 按严重性排序：critical > high > medium，同级按分数升序
+    severity_order = {"critical": 0, "high": 1, "medium": 2}
+    issues.sort(key=lambda x: (severity_order[x.severity], x.score))
+
+    return issues
+
+
 def reliability_band(score: float) -> str:
     if score >= 90:
         return "A 优秀：能力强，接口行为高度稳定"
@@ -1748,31 +1835,92 @@ def reliability_band(score: float) -> str:
     return "E 不建议：能力或接口可信度不足"
 
 
-def overall_rating(capability: float | None, availability: float) -> str:
-    """把能力分映射为 A–E，并按可用性限级。
+def overall_rating(capability: float | None, availability: float, severe_issues: list[SevereIssue] | None = None) -> str:
+    """把能力分映射为 A–E，并按可用性和严重问题降级。
 
     可用性不足说明接口/路由不稳定，此时即便成功探针表现优异也不应给出高评级：
     - 无成功探针：无法评分。
     - 可用性 100%：能力分直接决定评级（A–E 全段）。
     - 可用性 <100%：封顶到 C（不允许 A/B），低于 60% 追加更强提示。
+
+    严重问题降级：
+    - Critical 问题：降级 1-2 级（最多到 C）
+    - 2+ High 问题：降级 1 级
+    - 3+ Medium 问题：追加标注
     """
     if capability is None:
         return "N/A 接口不可用：无法评分"
+
+    # 基础评级（考虑可用性）
     if availability >= 100:
-        return reliability_band(capability)
-    capped = reliability_band(min(capability, 79.0))
-    note = "（接口不稳定，评级已限级）" if availability >= 60 else "（接口高度不稳定，评级仅供参考）"
-    return capped + note
+        base_rating = reliability_band(capability)
+    else:
+        capped = reliability_band(min(capability, 79.0))
+        note = "（接口不稳定，评级已限级）" if availability >= 60 else "（接口高度不稳定，评级仅供参考）"
+        base_rating = capped + note
+
+    # 严重问题降级
+    if not severe_issues:
+        return base_rating
+
+    critical_count = sum(1 for issue in severe_issues if issue.severity == "critical")
+    high_count = sum(1 for issue in severe_issues if issue.severity == "high")
+    medium_count = sum(1 for issue in severe_issues if issue.severity == "medium")
+
+    # 提取基础等级字母（A-E）
+    base_letter = base_rating[0] if base_rating and base_rating[0] in "ABCDEN" else "N"
+
+    # 降级逻辑
+    downgrade_levels = 0
+    downgrade_reason = ""
+
+    if critical_count > 0:
+        downgrade_levels = min(2, critical_count)  # Critical 最多降 2 级
+        downgrade_reason = f"严重问题（{critical_count} Critical）"
+    elif high_count >= 2:
+        downgrade_levels = 1
+        downgrade_reason = f"多项高危问题（{high_count} High）"
+    elif medium_count >= 3:
+        downgrade_reason = f"多项中等问题（{medium_count} Medium）"
+
+    if downgrade_levels > 0 and base_letter in "ABCDE":
+        # 降级映射
+        level_map = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
+        letters = ["A", "B", "C", "D", "E"]
+        current_level = level_map.get(base_letter, 2)
+        new_level = min(4, current_level + downgrade_levels)  # 最多降到 E
+        new_letter = letters[new_level]
+
+        # 提取基础评级的描述部分
+        description = base_rating.split("：", 1)[1] if "：" in base_rating else base_rating.split(" ", 1)[1] if " " in base_rating else ""
+
+        return f"{new_letter} ⬇️ {description}（降级：{downgrade_reason}）"
+    elif downgrade_reason and medium_count >= 3:
+        # 中等问题不降级，只追加标注
+        return f"{base_rating}（{downgrade_reason}）"
+
+    return base_rating
 
 
 def authenticity_note(model: str, results: list[ProbeResult]) -> tuple[str, str]:
-    """黑盒一致性评估，取保守口径：永不“证明”真实，证据不足即不下结论。"""
+    """黑盒一致性评估，取保守口径：永不证明真实，证据不足即不下结论。"""
     family = family_for_model(model)
     availability = availability_rate(results)
     if availability <= 0:
         return "无法判断", "所有请求失败；问题在中转站或该模型路由，不是模型输出能力。"
     if availability < 60:
         return "无法判断", "成功请求过少（接口不稳定），证据不足以评估真实性。"
+
+    # 检查严重问题，优先返回特定标注
+    severe_issues = detect_severe_issues(model, results)
+    for issue in severe_issues:
+        # 协议指纹异常
+        if issue.probe_id == "protocol_fingerprint" and issue.severity == "critical":
+            return "疑似协议转换/模型替换", f"协议指纹异常：{issue.reason}"
+
+        # Thinking signature 缺失（Claude 模型）
+        if issue.probe_id == "claude_thinking_signature" and issue.severity == "critical":
+            return "疑似非官方 Claude", f"Thinking signature 检测失败：{issue.reason}"
 
     if family == "unknown":
         return "无法按名称判断", "模型 ID 不含清晰 GPT/Claude 家族特征，无法做名称一致性判断；仅能参考通用能力。"
@@ -1827,7 +1975,8 @@ def build_decision_summary(model_results: dict[str, list[ProbeResult]]) -> list[
         auth, auth_reason = authenticity_note(model, results)
         errors, total, availability_text = availability_summary(results)
         ok = total - errors
-        rating = overall_rating(cap, avail)
+        severe_issues = detect_severe_issues(model, results)
+        rating = overall_rating(cap, avail, severe_issues)
         rows.append(
             {
                 "model": model,
@@ -1840,6 +1989,7 @@ def build_decision_summary(model_results: dict[str, list[ProbeResult]]) -> list[
                 "total_requests": total,
                 "availability_summary": availability_text,
                 "recommendation": recommendation_for(cap, avail, auth),
+                "severe_issues": severe_issues,  # 添加严重问题信息
             }
         )
     return rows
@@ -2084,26 +2234,50 @@ def build_report(model_results: dict[str, list[ProbeResult]], config: ApiConfig,
         avg_latency = int(statistics.mean(latencies)) if latencies else None
         capability_line = f"{cap:.1f}/100 ({ok}/{total} probes scored)" if cap is not None else "N/A (no successful probe)"
 
-        # 识别严重问题
-        severe_issues = [r for r in results if r.status == "ok" and r.score < 30 and r.probe.weight >= 15]
-        severe_note = ""
-        if severe_issues:
-            severe_note = f"\n\n⚠️  **SEVERE ISSUES DETECTED ({len(severe_issues)})**: " + ", ".join(r.probe.title for r in severe_issues)
+        # 检测严重问题
+        severe_issues = detect_severe_issues(model, results)
+
+        # 按严重性分组
+        critical_issues = [issue for issue in severe_issues if issue.severity == "critical"]
+        high_issues = [issue for issue in severe_issues if issue.severity == "high"]
+        medium_issues = [issue for issue in severe_issues if issue.severity == "medium"]
 
         lines.extend(
             [
                 f"## {model}",
                 "",
+            ]
+        )
+
+        # 显示严重问题汇总
+        if critical_issues:
+            lines.append(f"\n⚠️  **CRITICAL ISSUES ({len(critical_issues)})**:")
+            for issue in critical_issues:
+                lines.append(f"- {issue.icon} {issue.probe_title}: 分数 {issue.score:.1f}, {issue.reason}")
+            lines.append("")
+
+        if high_issues:
+            lines.append(f"⚠️  **HIGH ISSUES ({len(high_issues)})**:")
+            for issue in high_issues:
+                lines.append(f"- {issue.icon} {issue.probe_title}: 分数 {issue.score:.1f}, {issue.reason}")
+            lines.append("")
+
+        if medium_issues:
+            lines.append(f"⚠️  **MEDIUM ISSUES ({len(medium_issues)})**:")
+            for issue in medium_issues:
+                lines.append(f"- {issue.icon} {issue.probe_title}: 分数 {issue.score:.1f}, {issue.reason}")
+            lines.append("")
+
+        lines.extend(
+            [
                 f"- Capability: {capability_line}",
                 f"- Availability: {avail:.0f}% ({ok}/{total} requests OK) — {availability_text}",
-                f"- Rating: {overall_rating(cap, avail)}",
+                f"- Rating: {overall_rating(cap, avail, severe_issues)}",
                 f"- Authenticity: {auth}",
                 f"- Authenticity reason: {auth_reason}",
                 f"- Average latency: {avg_latency if avg_latency is not None else 'N/A'} ms",
             ]
         )
-        if severe_note:
-            lines.append(severe_note)
         lines.extend(
             [
                 "",
@@ -2111,16 +2285,19 @@ def build_report(model_results: dict[str, list[ProbeResult]], config: ApiConfig,
                 "| --- | --- | ---: | ---: | --- | --- |",
             ]
         )
+        # 创建探针 ID 到严重问题的映射
+        issue_map = {issue.probe_id: issue for issue in severe_issues}
+
         for result in results:
             # 严重问题标记
-            severity = ""
-            if result.status == "ok" and result.score < 30 and result.probe.weight >= 15:
-                severity = " ⚠️"
+            severity_icon = ""
+            if result.probe.probe_id in issue_map:
+                severity_icon = f" {issue_map[result.probe.probe_id].icon}"
 
             reason = result.reason.replace("|", "\\|").replace("\n", " ")
             error = (result.error or "").replace("|", "\\|").replace("\n", " ")
             lines.append(
-                f"| {result.probe.title}{severity} | {result.probe.category} | {result.probe.weight} | {result.score:.1f} | {result.status} | {reason or error} |"
+                f"| {result.probe.title}{severity_icon} | {result.probe.category} | {result.probe.weight} | {result.score:.1f} | {result.status} | {reason or error} |"
             )
         if errors:
             lines.extend(["", "### Error Summary", ""])
@@ -3495,7 +3672,8 @@ def run_audit(
         cap = capability_score(results)
         avail = availability_rate(results)
         auth, auth_reason = authenticity_note(model, results)
-        reporter.model_done(model, cap, avail, overall_rating(cap, avail), auth, auth_reason)
+        severe_issues = detect_severe_issues(model, results)
+        reporter.model_done(model, cap, avail, overall_rating(cap, avail, severe_issues), auth, auth_reason)
         if was_cancelled:
             break
 
