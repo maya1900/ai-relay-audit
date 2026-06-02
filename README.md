@@ -47,18 +47,29 @@ TUI 操作：
 
 检测进行时，底部状态栏会显示进度，例如 `Status: Running 3/9`。终端窗口过小时界面会提示放大而不是崩溃。
 
-TUI 每次只检测一个模型。`Model` 可以手动输入，也可以按 `F5` 从 `/v1/models` 拉取后选择。按 `F9` 前必须同时填好 `Base URL`、`API Key` 和 `Model`，不会自动选择模型。界面里的 `Detected family` 会根据当前模型名显示 GPT、Claude 或 unknown。选中不同字段时，左下角会显示这个选项的作用和下一步建议。
+TUI 每次只检测一个模型。`Model` 可以手动输入，也可以按 `F5` 从 `/v1/models` 拉取后选择。按 `F9` 前必须同时填好 `Base URL`、`API Key` 和 `Model`，不会自动选择模型。界面里的 `Detected family` 会根据当前模型名显示 GPT、Claude、Gemini 或 unknown。选中不同字段时，左下角会显示这个选项的作用和下一步建议。
 
 TUI 检测完成后会直接把 Markdown 报告展示在右侧日志里。默认不写文件；需要保存时可以勾选 `Save report file` 自动写入 `Output dir`，也可以在完成后按 `s` 一键保存最近一次报告。
 
+## 检测模式
+
+`Mode` 字段用来选择检测强度：
+
+- `quick`：快速验证模式，仅运行 2 个核心探针（JSON 输出、身份自述），适合快速检查模型是否可用。
+- `standard`：标准模式（默认），运行 7-8 个探针，包含通用能力、协议指纹、thinking signature 等，覆盖大部分常见问题。
+- `full`：完整模式，运行所有探针（含所有针对性探针），适合全面评估或怀疑模型冒充时使用。
+
+## API 协议风格
+
 `API style` 用来选择模型调用协议：
 
-- `auto`：默认。GPT 模型先尝试 OpenAI `/v1/responses`，再回退 `/v1/chat/completions`；Claude 模型先尝试 Anthropic `/v1/messages`，再回退 OpenAI 兼容接口。
+- `auto`：默认。GPT 模型先尝试 OpenAI `/v1/responses`，再回退 `/v1/chat/completions`；Claude 模型先尝试 Anthropic `/v1/messages`，再回退 OpenAI 兼容接口；Gemini 模型先尝试 Google Gemini API，再回退 OpenAI 兼容接口。
 - `openai-responses`：强制使用 OpenAI `/v1/responses`。
 - `openai-chat`：强制使用 OpenAI 兼容 `/v1/chat/completions`。
 - `anthropic`：强制使用 Anthropic 风格 `/v1/messages`。
+- `gemini`：强制使用 Google Gemini API `/v1/models/{model}:generateContent`。
 
-很多中转站虽然模型名是 Claude，但仍然做成 OpenAI 兼容接口；也有站点对 GPT 新模型只重点支持 `/v1/responses`。检测失败时可以切换这个选项复测。
+很多中转站虽然模型名是 Claude，但仍然做成 OpenAI 兼容接口；也有站点对 GPT 新模型只重点支持 `/v1/responses`。Gemini 模型的中转站可能使用原生 Gemini API 或 OpenAI 兼容接口。
 
 也可以使用一步一步输入的向导：
 
@@ -177,34 +188,70 @@ python3 ai_relay_audit.py \
 }
 ```
 
-`scorer` 只能使用内置评分器 ID（例如 `json_contract`、`reasoning`、`instruction_resistance`、`code_task`、`identity`、`claude_xml`、`claude_safety`、`gpt_schema`、`gpt_math`），不会执行外部代码。
+`scorer` 只能使用内置评分器 ID（例如 `json_contract`、`reasoning`、`instruction_resistance`、`code_task`、`identity`、`claude_xml`、`claude_safety`、`gpt_schema`、`gpt_math`、`claude_thinking_signature`、`protocol_fingerprint`、`stream_consistency`），不会执行外部代码。
 
 ## 评分口径
 
 每个模型给出两个相互独立的指标：
 
 - **能力分（Capability）**：只对成功返回的探针按权重加权，满分 100。请求失败的探针不计入
-  （不再以 0 分拖垮能力分），因此能力分只反映“模型答得好不好”。若所有探针都失败，能力分为 N/A。
-- **可用性（Availability）**：成功返回的探针请求占比，反映“中转站 / 路由稳不稳”。
+  （不再以 0 分拖垮能力分），因此能力分只反映”模型答得好不好”。若所有探针都失败，能力分为 N/A。
+- **可用性（Availability）**：成功返回的探针请求占比，反映”中转站 / 路由稳不稳”。
 
 探针权重：
 
-- 通用结构化输出一致性：12
-- 通用多约束推理：18
-- 通用提示注入抵抗：18
-- 通用代码任务能力：18
-- 身份自述与黑盒限制意识：8
-- GPT/Claude 针对性探针：每项 13
+- 通用结构化输出一致性：10
+- 通用多约束推理：15
+- 通用提示注入抵抗：15
+- 通用代码任务能力：15
+- Stream/Non-stream 响应一致性：10
+- 身份自述与黑盒限制意识：5
+- 协议指纹（usage 字段一致性）：10
+- Claude 针对性探针：
+  - XML 长指令处理：10
+  - 安全边界与替代方案：10
+  - **thinking signature 加密签名验证：25（真伪验证金标准）**
+- GPT 针对性探针：
+  - 函数调用式 JSON：20
+  - 紧凑数学推理：20
+
+**关于 Stream/Non-stream 一致性检测：**
+
+某些中转站在 streaming 模式下可能返回不同的模型或篡改内容。此探针会分别调用 stream 和 non-stream 接口，比较两次响应的一致性。目前仅支持 OpenAI 兼容接口的 streaming 检测。
+
+**关于协议指纹检测：**
+
+通过分析 API 响应中的 usage 字段，检测中转站是否在做协议转换或模型替换。例如，GPT 请求返回 Anthropic 风格的 usage 字段（input_tokens/output_tokens），或 Claude 请求只返回 OpenAI 字段（prompt_tokens/completion_tokens），都可能表明中转站在做模型替换。
+
+**关于 Claude thinking signature 检测：**
+
+这是真伪验证的核心探针，权重 25%。Claude 启用扩展思考（extended thinking）时，响应中会包含由 Anthropic 服务端生成的加密签名（signature 字段），长度 500-3000 字符。此签名理论上无法被中转站伪造，因此是检测真实 Claude 后端的金标准。
+
+- 如果检测到有效 signature：极大概率为真实 Claude 官方后端
+- 如果触发了 thinking 但无 signature：疑似非官方 Claude（如 Kiro、Amazon Q、Bedrock 简化接口）或中转站剥离了签名
+- 如果未触发 thinking：可能中转站不支持该参数，或模型本身不是 Claude
 
 评级（A–E）由能力分映射，并按可用性限级：
 
 - 可用性 100%：按能力分取 A–E 全段（A≥90，B 80–89，C 65–79，D 50–64，E<50）。
-- 可用性 <100%：接口不稳定，评级封顶到 C（不给 A/B）；低于 60% 再追加“仅供参考”提示。
+- 可用性 <100%：接口不稳定，评级封顶到 C（不给 A/B）；低于 60% 再追加”仅供参考”提示。
 - 无任何成功探针：评级为 `N/A 接口不可用：无法评分`。
 
-真实性（Authenticity）是保守的黑盒一致性评估：永远不“证明”真实底层模型；请求过少或模型名
-无法判断家族时直接给出“无法判断 / 无法按名称判断”；针对性探针偏低会优先标注“疑似不匹配”；
-即便名称、能力、身份自述都一致，最好的结论也只是“未发现不一致”，并注明黑盒 API 无法证明真实模型。
+**严重问题标注：**
+
+报告中会自动标注严重问题（⚠️  SEVERE）。当探针满足以下条件时被标记为严重：
+- 探针成功返回（status = ok）
+- 得分低于 30 分
+- 探针权重 ≥ 15（即核心能力探针）
+
+严重问题会在报告的多个位置突出显示：
+- 实时日志中以 “⚠️  SEVERE” 标记
+- 报告摘要中单独列出所有严重问题
+- 探针详情表格中用 ⚠️  标记
+
+真实性（Authenticity）是保守的黑盒一致性评估：永远不”证明”真实底层模型；请求过少或模型名
+无法判断家族时直接给出”无法判断 / 无法按名称判断”；针对性探针偏低会优先标注”疑似不匹配”；
+即便名称、能力、身份自述都一致，最好的结论也只是”未发现不一致”，并注明黑盒 API 无法证明真实模型。
 
 ## 输出
 

@@ -15,6 +15,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import ai_relay_audit as m
 
@@ -73,6 +74,8 @@ class FamilyForModelTest(unittest.TestCase):
         self.assertEqual(m.family_for_model("claude-3-5-sonnet-20241022"), "claude")
         self.assertEqual(m.family_for_model("gpt-4o"), "gpt")
         self.assertEqual(m.family_for_model("o3-mini"), "gpt")
+        self.assertEqual(m.family_for_model("gemini-2.0-flash-exp"), "gemini")
+        self.assertEqual(m.family_for_model("gemini-1.5-pro"), "gemini")
         self.assertEqual(m.family_for_model("llama-3-70b"), "unknown")
 
 
@@ -84,6 +87,16 @@ class IsReasoningModelTest(unittest.TestCase):
     def test_non_reasoning_models(self) -> None:
         for model in ("gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest", "claude-3-5-sonnet", "gpt-4-turbo"):
             self.assertFalse(m.is_reasoning_model(model), model)
+
+
+class ApiStyleTest(unittest.TestCase):
+    def test_normalize_api_style_aliases(self) -> None:
+        self.assertEqual(m.normalize_api_style("openai"), "openai-chat")
+        self.assertEqual(m.normalize_api_style("responses"), "openai-responses")
+        self.assertEqual(m.normalize_api_style("google"), "gemini")
+        self.assertEqual(m.normalize_api_style("gemini"), "gemini")
+        self.assertEqual(m.normalize_api_style("google"), "gemini")
+        self.assertEqual(m.normalize_api_style("gemini"), "gemini")
 
 
 class ExtractJsonObjectTest(unittest.TestCase):
@@ -229,6 +242,44 @@ class ScoreGptMathTest(unittest.TestCase):
         text = "value 430 is not prime; 143 = 11 * 13 (mod stuff)"
         score, reason = m.score_gpt_math(text)
         self.assertIn("答案43=False", reason)
+
+
+class ScoreStreamConsistencyTest(unittest.TestCase):
+    def test_identical_responses(self) -> None:
+        stream = "red, blue, green"
+        non_stream = "red, blue, green"
+        score, reason = m.score_stream_consistency("", stream, non_stream)
+        self.assertEqual(score, 100, reason)
+        self.assertIn("完全一致", reason)
+
+    def test_whitespace_differences_normalized(self) -> None:
+        stream = "red,  blue,   green"
+        non_stream = "red, blue, green"
+        score, reason = m.score_stream_consistency("", stream, non_stream)
+        self.assertEqual(score, 100, reason)
+
+    def test_partial_match(self) -> None:
+        stream = "red, blue, green and yellow"
+        non_stream = "red, blue, green"
+        score, reason = m.score_stream_consistency("", stream, non_stream)
+        self.assertGreaterEqual(score, 60, reason)
+        self.assertIn("部分", reason)
+
+    def test_severe_inconsistency(self) -> None:
+        stream = "completely different response"
+        non_stream = "red, blue, green"
+        score, reason = m.score_stream_consistency("", stream, non_stream)
+        self.assertLess(score, 50, reason)
+
+    def test_missing_responses(self) -> None:
+        score, reason = m.score_stream_consistency("", None, "test")
+        self.assertEqual(score, 50, reason)
+        score, reason = m.score_stream_consistency("", "test", None)
+        self.assertEqual(score, 50, reason)
+
+    def test_empty_responses(self) -> None:
+        score, reason = m.score_stream_consistency("", "", "test")
+        self.assertEqual(score, 0, reason)
 
 
 class RedactSecretsTest(unittest.TestCase):
@@ -426,14 +477,14 @@ class RunEstimateTest(unittest.TestCase):
         estimate = m.build_run_estimate(cfg, cfg.models)
         self.assertEqual(estimate.model_count, 2)
         self.assertEqual(estimate.probes_by_model["gpt-4o"], 7)
-        self.assertEqual(estimate.probes_by_model["claude-3-haiku"], 7)
-        self.assertEqual(estimate.probe_requests, 14)
+        self.assertEqual(estimate.probes_by_model["claude-3-haiku"], 8)
+        self.assertEqual(estimate.probe_requests, 15)
 
     def test_all_targeted_adds_all_targeted_probes(self) -> None:
         cfg = m.AuditConfig(make_config(), ["llama-3"], None, None, True, False, "reports", False)
         estimate = m.build_run_estimate(cfg, cfg.models)
-        self.assertEqual(estimate.probes_by_model["llama-3"], 9)
-        self.assertEqual(estimate.max_output_tokens, 9 * cfg.api.max_tokens)
+        self.assertEqual(estimate.probes_by_model["llama-3"], 8)
+        self.assertEqual(estimate.max_output_tokens, 8 * cfg.api.max_tokens)
 
     def test_known_price_estimate_uses_output_upper_bound(self) -> None:
         cfg = m.AuditConfig(make_config(), ["gpt-5.5"], None, None, False, False, "reports", False)
@@ -474,6 +525,25 @@ class ReportOutputTest(unittest.TestCase):
         self.assertIn("summary", data)
         self.assertIn("models", data)
         self.assertIn("gpt-4o", data["models"])
+
+
+class TuiSaveTest(unittest.TestCase):
+    def test_save_latest_report_does_not_write_again_when_already_saved(self) -> None:
+        app = m.TuiApp.__new__(m.TuiApp)
+        app.language = "zh"
+        app.logs = []
+        app.log_scroll = 0
+        app.last_saved_paths = ("old.md", "old.json")
+        app.last_model_results = {"gpt-4o": [make_result(score=90)]}
+        app.last_report_config = make_config()
+        app.last_report_output_dir = "reports"
+        app.last_report_unsaved = False
+
+        with mock.patch.object(m, "write_reports", side_effect=AssertionError("should not write")):
+            app.save_latest_report()
+
+        self.assertIn("报告已保存过。", app.logs)
+        self.assertIn("Markdown: old.md", app.logs)
 
 
 class ErrorSuggestionTest(unittest.TestCase):
