@@ -8,9 +8,40 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import unittest
 
 import ai_relay_audit as m
+
+
+def make_probe(
+    probe_id: str = "p",
+    category: str = "universal",
+    weight: int = 10,
+    families: tuple[str, ...] = ("gpt", "claude", "unknown"),
+) -> m.Probe:
+    return m.Probe(probe_id, probe_id, category, weight, families, "sys", "user", lambda t: (0.0, ""))
+
+
+def make_result(
+    probe_id: str = "p",
+    category: str = "universal",
+    weight: int = 10,
+    status: str = "ok",
+    score: float = 100.0,
+) -> m.ProbeResult:
+    return m.ProbeResult(
+        probe=make_probe(probe_id, category, weight),
+        status=status,
+        score=score,
+        reason="",
+        response="hello",
+        latency_ms=10 if status == "ok" else None,
+        usage=None,
+        error=None if status == "ok" else "boom",
+    )
 
 
 def make_config(api_key: str = "sk-test") -> m.ApiConfig:
@@ -207,6 +238,165 @@ class RedactSecretsTest(unittest.TestCase):
     def test_no_key_noop(self) -> None:
         config = make_config(api_key="")
         self.assertEqual(m.redact_secrets("plain text", config), "plain text")
+
+
+class CapabilityScoreTest(unittest.TestCase):
+    def test_over_successful_only(self) -> None:
+        # 失败探针被排除，不再以 0 分拖垮能力评估。
+        results = [
+            make_result("a", weight=10, status="ok", score=80),
+            make_result("b", weight=10, status="error", score=0),
+        ]
+        self.assertAlmostEqual(m.capability_score(results), 80.0)
+
+    def test_none_when_all_failed(self) -> None:
+        self.assertIsNone(m.capability_score([make_result(status="error")]))
+        self.assertIsNone(m.capability_score([]))
+
+    def test_weighted_over_ok(self) -> None:
+        results = [
+            make_result("a", weight=10, status="ok", score=100),
+            make_result("b", weight=30, status="ok", score=0),
+        ]
+        self.assertAlmostEqual(m.capability_score(results), 25.0)
+
+
+class AvailabilityRateTest(unittest.TestCase):
+    def test_fraction(self) -> None:
+        results = [
+            make_result(status="ok"),
+            make_result(status="ok"),
+            make_result(status="error"),
+            make_result(status="error"),
+        ]
+        self.assertEqual(m.availability_rate(results), 50.0)
+
+    def test_empty_is_zero(self) -> None:
+        self.assertEqual(m.availability_rate([]), 0.0)
+
+    def test_all_ok(self) -> None:
+        self.assertEqual(m.availability_rate([make_result(status="ok")]), 100.0)
+
+
+class OverallRatingTest(unittest.TestCase):
+    def test_none_capability_is_na(self) -> None:
+        self.assertTrue(m.overall_rating(None, 0.0).startswith("N/A"))
+
+    def test_full_range_at_full_availability(self) -> None:
+        self.assertTrue(m.overall_rating(95.0, 100.0).startswith("A"))
+        self.assertTrue(m.overall_rating(82.0, 100.0).startswith("B"))
+
+    def test_capped_at_c_below_full_availability(self) -> None:
+        # 能力强但接口不稳定：不允许 A/B，封顶到 C 并标注限级。
+        rating = m.overall_rating(95.0, 80.0)
+        self.assertTrue(rating.startswith("C"))
+        self.assertIn("限级", rating)
+
+    def test_strong_warning_below_60(self) -> None:
+        rating = m.overall_rating(95.0, 40.0)
+        self.assertTrue(rating.startswith("C"))
+        self.assertIn("仅供参考", rating)
+
+    def test_capping_never_raises_a_weak_model(self) -> None:
+        self.assertTrue(m.overall_rating(30.0, 80.0).startswith("E"))
+
+
+class AuthenticityNoteTest(unittest.TestCase):
+    def _good_gpt(self) -> list[m.ProbeResult]:
+        return [
+            make_result("universal_json", "universal", 12, "ok", 90),
+            make_result("universal_reasoning", "universal", 18, "ok", 85),
+            make_result("identity_limits", "identity", 8, "ok", 90),
+            make_result("gpt_math", "targeted", 13, "ok", 85),
+        ]
+
+    def test_all_failed_is_unknown(self) -> None:
+        self.assertEqual(m.authenticity_note("gpt-4o", [make_result(status="error")])[0], "无法判断")
+
+    def test_low_availability_is_unknown(self) -> None:
+        results = [
+            make_result("identity_limits", "identity", 8, "ok", 90),
+            make_result("b", "universal", 10, "error", 0),
+            make_result("c", "universal", 10, "error", 0),
+        ]
+        self.assertEqual(m.authenticity_note("gpt-4o", results)[0], "无法判断")
+
+    def test_unknown_family(self) -> None:
+        self.assertEqual(m.authenticity_note("llama-3-70b", self._good_gpt())[0], "无法按名称判断")
+
+    def test_weak_targeted_flags_mismatch(self) -> None:
+        results = self._good_gpt()
+        results[-1] = make_result("gpt_math", "targeted", 13, "ok", 30)
+        self.assertEqual(m.authenticity_note("gpt-4o", results)[0], "疑似不匹配")
+
+    def test_missing_identity_is_insufficient(self) -> None:
+        results = [r for r in self._good_gpt() if r.probe.probe_id != "identity_limits"]
+        self.assertEqual(m.authenticity_note("gpt-4o", results)[0], "证据不足")
+
+    def test_best_case_never_affirms_authenticity(self) -> None:
+        label, reason = m.authenticity_note("gpt-4o", self._good_gpt())
+        self.assertEqual(label, "未发现不一致")
+        self.assertIn("无法证明", reason)
+
+
+class AuditConfigTest(unittest.TestCase):
+    def test_from_namespace_parses_models_and_strips_v1(self) -> None:
+        ns = argparse.Namespace(
+            base_url="https://x.com/v1", api_key="sk", models="a, b ,c",
+            timeout=30, max_tokens=900, temperature=0.0, api_style="auto",
+            model_filter=None, limit=None, all_targeted=False, hide_prompts=False, output_dir="out",
+        )
+        cfg = m.AuditConfig.from_namespace(ns)
+        self.assertEqual(cfg.api.base_url, "https://x.com")
+        self.assertEqual(cfg.models, ["a", "b", "c"])
+        self.assertEqual(cfg.output_dir, "out")
+        self.assertTrue(cfg.save_report)  # CLI/wizard 默认写报告
+
+    def test_defaults_when_attrs_missing(self) -> None:
+        cfg = m.AuditConfig.from_namespace(argparse.Namespace(base_url=None, api_key=None))
+        self.assertEqual(cfg.api.base_url, "")
+        self.assertEqual(cfg.models, [])
+        self.assertEqual(cfg.api.timeout, m.DEFAULT_TIMEOUT)
+        self.assertEqual(cfg.output_dir, "reports")
+
+
+class ValidateFieldTest(unittest.TestCase):
+    def test_timeout_positive_int(self) -> None:
+        self.assertIsNone(m.validate_field("timeout", "90"))
+        self.assertIsNotNone(m.validate_field("timeout", "0"))
+        self.assertIsNotNone(m.validate_field("timeout", "x"))
+        self.assertIsNotNone(m.validate_field("timeout", ""))
+
+    def test_temperature_float(self) -> None:
+        self.assertIsNone(m.validate_field("temperature", "0.7"))
+        self.assertIsNone(m.validate_field("temperature", ""))
+        self.assertIsNotNone(m.validate_field("temperature", "hot"))
+
+    def test_limit_optional_int(self) -> None:
+        self.assertIsNone(m.validate_field("limit", ""))
+        self.assertIsNone(m.validate_field("limit", "5"))
+        self.assertIsNotNone(m.validate_field("limit", "five"))
+
+    def test_free_text_has_no_validator(self) -> None:
+        self.assertIsNone(m.validate_field("base_url", "whatever"))
+
+
+class ConsoleReporterTest(unittest.TestCase):
+    def test_probe_result_ok_prints_score(self) -> None:
+        result = m.ProbeResult(make_probe(), "ok", 87.5, "good", "hello", 12, {"total_tokens": 3})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            m.ConsoleReporter().probe_result(result, show_prompt=False)
+        out = buf.getvalue()
+        self.assertIn("判分: 87.5/100", out)
+        self.assertIn("模型回复:", out)
+
+    def test_probe_result_error_prints_failure(self) -> None:
+        result = m.ProbeResult(make_probe(), "error", 0, "fail", "", None, None, "HTTP 500")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            m.ConsoleReporter().probe_result(result, show_prompt=False)
+        self.assertIn("失败: HTTP 500", buf.getvalue())
 
 
 if __name__ == "__main__":
