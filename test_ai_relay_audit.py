@@ -272,10 +272,20 @@ class ScoreStreamConsistencyTest(unittest.TestCase):
         self.assertLess(score, 50, reason)
 
     def test_missing_responses(self) -> None:
+        # 两个都缺失
+        score, reason = m.score_stream_consistency("", None, None)
+        self.assertEqual(score, 50, reason)
+        self.assertIn("均未获取", reason)
+
+        # stream 缺失
         score, reason = m.score_stream_consistency("", None, "test")
         self.assertEqual(score, 50, reason)
+        self.assertIn("stream 响应获取失败", reason)
+
+        # non-stream 缺失
         score, reason = m.score_stream_consistency("", "test", None)
         self.assertEqual(score, 50, reason)
+        self.assertIn("non-stream 响应获取失败", reason)
 
     def test_empty_responses(self) -> None:
         score, reason = m.score_stream_consistency("", "", "test")

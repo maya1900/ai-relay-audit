@@ -1089,8 +1089,14 @@ def score_stream_consistency(text: str, stream_response: str | None = None, non_
 
     某些中转站在 stream 模式下返回不同的模型或篡改内容。
     """
-    if stream_response is None or non_stream_response is None:
-        return 50, "未获取到 stream 和 non-stream 响应"
+    if stream_response is None and non_stream_response is None:
+        return 50, "stream 和 non-stream 响应均未获取（该探针需要 OpenAI 兼容接口）"
+
+    if stream_response is None:
+        return 50, "stream 响应获取失败（中转站可能不支持 streaming，或仅在 stream 模式下出错）"
+
+    if non_stream_response is None:
+        return 50, "non-stream 响应获取失败"
 
     # 规范化响应：移除空白符差异
     stream_normalized = " ".join(stream_response.strip().split())
@@ -1642,23 +1648,28 @@ def run_probe(
             )
         elif probe.probe_id == "stream_consistency":
             # 特殊处理 stream 一致性探针：需要分别调用 stream 和 non-stream
-            # 目前只支持 OpenAI 兼容接口的 streaming
+            # 只对 OpenAI 兼容接口测试（Anthropic 和 Gemini 的 streaming 格式不同）
+            stream_response = None
+            non_stream_response = None
+
+            # 先尝试 non-stream 请求
             try:
-                # Non-stream call
                 non_stream_response, usage, latency_ms = chat(config, model, probe.system, probe.user)
-
-                # Stream call - 只对 OpenAI 兼容接口测试
-                stream_response = None
-                if config.api_style in ("auto", "openai-chat", "openai"):
-                    try:
-                        stream_response, _, _ = chat_openai(config, model, probe.system, probe.user, stream=True)
-                    except Exception:  # noqa: BLE001
-                        # Streaming 失败不影响整体评分，标记为部分可用
-                        pass
-
-                response = non_stream_response
             except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(f"Stream consistency probe failed: {exc}") from exc
+                raise RuntimeError(f"Non-stream request failed: {exc}") from exc
+
+            # 再尝试 stream 请求（仅对 OpenAI 风格）
+            resolved_style = normalize_api_style(config.api_style)
+            if resolved_style in ("auto", "openai-chat"):
+                try:
+                    stream_response, _, _ = chat_openai(config, model, probe.system, probe.user, stream=True)
+                except Exception as exc:  # noqa: BLE001
+                    # Stream 失败时记录错误，但不阻断整个探针
+                    # 评分器会处理 stream_response=None 的情况
+                    pass
+
+            # 将 non_stream_response 作为主要响应用于显示
+            response = non_stream_response
         else:
             # 常规探针使用标准 chat 函数
             response, usage, latency_ms = chat(config, model, probe.system, probe.user)
