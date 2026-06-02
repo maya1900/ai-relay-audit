@@ -34,19 +34,22 @@ python3 ai_relay_audit.py --tui
 TUI 操作：
 
 - `Tab` / 方向键：切换字段
-- `Enter`：编辑字段或切换复选项（Timeout / Max tokens / Temperature 等数值字段即时校验，非法值无法保存）
-- `F5`：按当前 Base URL、API Key 拉取模型列表，然后弹窗选择一个模型
-- `F9`：开始检测当前 `Model`（开始前会校验必填项与数值字段）
+- `Enter`：编辑字段或切换复选项（Timeout / Max tokens / Temperature / Limit 等数值字段即时校验，非法值无法保存）
+- `F5`：按当前 Base URL、API Key 拉取模型列表，应用 `Model filter` / `Limit` 后弹窗选择一个模型；弹窗内可直接打字搜索，`Backspace` 删除，`Ctrl+U` 清空
+- `F9`：开始检测当前 `Model`；真正运行前会显示模型数、请求数、最大输出 token 暴露和保存状态，`Enter` 确认，`Esc` 取消
+- `l` / `r` / `d` / `e`：切换右侧视图为实时日志 / 完整报告 / 探针详情 / 错误建议
+- `s`：检测完成后，如果报告尚未保存，一键保存最近一次 Markdown / JSON 报告
+- `g`：切换中英文界面
 - `Esc` / `c`：取消正在进行的检测（当前探针结束后停止，已完成部分仍会出报告）
-- 鼠标滚轮 / `PageUp` / `PageDown`：滚动右侧日志
-- `Home` / `End`：跳到日志顶部 / 底部
+- 鼠标滚轮 / `PageUp` / `PageDown`：滚动当前右侧视图
+- `Home` / `End`：跳到当前右侧视图顶部 / 底部
 - `q`：退出（检测进行中需先取消）
 
 检测进行时，底部状态栏会显示进度，例如 `Status: Running 3/9`。终端窗口过小时界面会提示放大而不是崩溃。
 
 TUI 每次只检测一个模型。`Model` 可以手动输入，也可以按 `F5` 从 `/v1/models` 拉取后选择。按 `F9` 前必须同时填好 `Base URL`、`API Key` 和 `Model`，不会自动选择模型。界面里的 `Detected family` 会根据当前模型名显示 GPT、Claude 或 unknown。选中不同字段时，左下角会显示这个选项的作用和下一步建议。
 
-TUI 检测完成后会直接把 Markdown 报告展示在右侧日志里。默认不写文件；需要保存时勾选 `Save report file`，报告会写入 `Output dir`。
+TUI 检测完成后会直接把 Markdown 报告展示在右侧日志里。默认不写文件；需要保存时可以勾选 `Save report file` 自动写入 `Output dir`，也可以在完成后按 `s` 一键保存最近一次报告。
 
 `API style` 用来选择模型调用协议：
 
@@ -63,7 +66,14 @@ TUI 检测完成后会直接把 Markdown 报告展示在右侧日志里。默认
 python3 ai_relay_audit.py --wizard
 ```
 
-或者直接用命令行参数运行：
+或者直接用命令行参数运行。脚本会自动读取当前目录的 `.env`（不会覆盖已经存在的环境变量），也可以继续手动 `export`：
+
+```bash
+cd ai-relay-audit
+cp example.env .env
+# 编辑 .env，填入 AI_RELAY_API_KEY / AI_RELAY_BASE_URL
+python3 ai_relay_audit.py
+```
 
 ```bash
 cd ai-relay-audit
@@ -99,8 +109,8 @@ python3 ai_relay_audit.py \
 ## 常用参数
 
 ```text
---base-url        中转站地址，支持带或不带 /v1
---api-key         API key；也可用环境变量 AI_RELAY_API_KEY
+--base-url        中转站地址，支持带或不带 /v1；也可用环境变量 / .env 里的 AI_RELAY_BASE_URL
+--api-key         API key；也可用环境变量 / .env 里的 AI_RELAY_API_KEY
 --tui             启动全屏终端界面
 --wizard          启动一步一步输入向导
 --models          逗号分隔的模型 ID；省略时自动请求 /v1/models
@@ -109,11 +119,65 @@ python3 ai_relay_audit.py \
 --all-targeted    对每个模型都运行 GPT 和 Claude 针对性探针
 --hide-prompts    不打印完整提示词，只打印结果过程
 --output-dir      报告输出目录，默认 reports
+--baseline        运行本次检测后，与一个历史 audit_report_*.json 做 baseline 对比
+--compare-only    不触网，直接对比两个历史 JSON 报告
+--probes-config   使用外部 JSON 探针配置；scorer 只能引用内置评分器 ID
 --timeout         请求超时秒数，默认 90
 --max-tokens      每次检测最大输出 token，默认 900
 --temperature     默认 0
 --api-style       auto/openai-responses/openai-chat/anthropic，默认 auto
 ```
+
+## 报告对比 / baseline
+
+如果想长期跟踪同一个中转站的质量变化，可以把上一次 JSON 报告作为 baseline：
+
+```bash
+python3 ai_relay_audit.py \
+  --base-url "https://your-relay.example.com" \
+  --models "gpt-4o" \
+  --baseline reports/audit_report_20260101_120000.json
+```
+
+也可以不触网，只对比两个已经保存的 JSON：
+
+```bash
+python3 ai_relay_audit.py --compare-only old.json new.json
+```
+
+对比会按模型 ID 和 `probe_id` 匹配，报告新增/移除模型、能力分/可用性/评级/真实性变化，以及单个探针的状态和分数变化。
+
+## 外部探针配置
+
+默认探针仍然内置在脚本里。需要实验性自定义探针时，可传入 JSON：
+
+```bash
+python3 ai_relay_audit.py \
+  --base-url "https://your-relay.example.com" \
+  --models "gpt-4o" \
+  --probes-config probes.json
+```
+
+配置示例：
+
+```json
+{
+  "probes": [
+    {
+      "probe_id": "custom_json",
+      "title": "Custom JSON check",
+      "category": "universal",
+      "weight": 10,
+      "families": ["unknown", "gpt", "claude"],
+      "system": "Return only JSON.",
+      "user": "Return {\"ok\": true}.",
+      "scorer": "json_contract"
+    }
+  ]
+}
+```
+
+`scorer` 只能使用内置评分器 ID（例如 `json_contract`、`reasoning`、`instruction_resistance`、`code_task`、`identity`、`claude_xml`、`claude_safety`、`gpt_schema`、`gpt_math`），不会执行外部代码。
 
 ## 评分口径
 

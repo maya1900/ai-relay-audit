@@ -11,6 +11,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
+import os
+import tempfile
 import unittest
 
 import ai_relay_audit as m
@@ -358,6 +361,221 @@ class AuditConfigTest(unittest.TestCase):
         self.assertEqual(cfg.models, [])
         self.assertEqual(cfg.api.timeout, m.DEFAULT_TIMEOUT)
         self.assertEqual(cfg.output_dir, "reports")
+
+
+class FilterModelsTest(unittest.TestCase):
+    def test_regex_and_limit(self) -> None:
+        models = ["gpt-4o", "claude-3-5-sonnet", "llama-3", "gpt-4o-mini"]
+        self.assertEqual(m.filter_models(models, "gpt", 1), ["gpt-4o"])
+
+    def test_no_filter_preserves_order(self) -> None:
+        models = ["b", "a", "c"]
+        self.assertEqual(m.filter_models(models, None, None), models)
+
+    def test_empty_results(self) -> None:
+        self.assertEqual(m.filter_models(["gpt-4o"], "claude", None), [])
+
+    def test_invalid_regex_is_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            m.filter_models(["gpt-4o"], "(", None)
+
+    def test_negative_limit_is_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            m.filter_models(["gpt-4o"], None, -1)
+
+
+class RunEstimateTest(unittest.TestCase):
+    def test_counts_family_specific_probes(self) -> None:
+        cfg = m.AuditConfig(make_config(), ["gpt-4o", "claude-3-haiku"], None, None, False, False, "reports", True)
+        estimate = m.build_run_estimate(cfg, cfg.models)
+        self.assertEqual(estimate.model_count, 2)
+        self.assertEqual(estimate.probes_by_model["gpt-4o"], 7)
+        self.assertEqual(estimate.probes_by_model["claude-3-haiku"], 7)
+        self.assertEqual(estimate.probe_requests, 14)
+
+    def test_all_targeted_adds_all_targeted_probes(self) -> None:
+        cfg = m.AuditConfig(make_config(), ["llama-3"], None, None, True, False, "reports", False)
+        estimate = m.build_run_estimate(cfg, cfg.models)
+        self.assertEqual(estimate.probes_by_model["llama-3"], 9)
+        self.assertEqual(estimate.max_output_tokens, 9 * cfg.api.max_tokens)
+
+
+class DecisionSummaryTest(unittest.TestCase):
+    def test_normal_model_summary(self) -> None:
+        rows = m.build_decision_summary({"gpt-4o": [make_result(score=90)]})
+        self.assertEqual(rows[0]["model"], "gpt-4o")
+        self.assertEqual(rows[0]["availability"], 100.0)
+        self.assertIn("recommendation", rows[0])
+
+    def test_all_failed_recommends_no_use(self) -> None:
+        rows = m.build_decision_summary({"gpt-4o": [make_result(status="error", score=0)]})
+        self.assertIsNone(rows[0]["capability"])
+        self.assertIn("Do not use", rows[0]["recommendation"])
+
+
+class ReportOutputTest(unittest.TestCase):
+    def test_build_report_has_decision_summary(self) -> None:
+        report = m.build_report({"gpt-4o": [make_result(score=90)]}, make_config())
+        self.assertIn("## Decision Summary", report)
+        self.assertIn("| Model | Rating | Capability | Availability | Authenticity | Recommendation |", report)
+
+    def test_write_reports_json_has_summary_and_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _md_path, json_path = m.write_reports(tmpdir, {"gpt-4o": [make_result(score=90)]}, make_config())
+            with open(json_path, encoding="utf-8") as file:
+                data = json.load(file)
+        self.assertIn("summary", data)
+        self.assertIn("models", data)
+        self.assertIn("gpt-4o", data["models"])
+
+
+class ErrorSuggestionTest(unittest.TestCase):
+    def test_auth_error(self) -> None:
+        suggestions = m.suggest_next_steps("HTTP 401: invalid token")
+        self.assertTrue(any("API key" in item for item in suggestions))
+
+    def test_auto_failed(self) -> None:
+        suggestions = m.suggest_next_steps("auto failed: openai-chat: No choices")
+        self.assertTrue(any("api-style" in item for item in suggestions))
+
+    def test_no_models(self) -> None:
+        suggestions = m.suggest_next_steps("No models to audit.")
+        self.assertTrue(any("Model filter" in item for item in suggestions))
+
+
+class DotenvTest(unittest.TestCase):
+    def test_parse_env_lines(self) -> None:
+        parsed = m.parse_env_lines([
+            "# comment\n",
+            "AI_RELAY_API_KEY='sk-test'\n",
+            'AI_RELAY_BASE_URL="https://relay.example.com/v1" # inline\n',
+            "BAD LINE\n",
+        ])
+        self.assertEqual(parsed["AI_RELAY_API_KEY"], "sk-test")
+        self.assertEqual(parsed["AI_RELAY_BASE_URL"], "https://relay.example.com/v1")
+
+    def test_load_dotenv_does_not_override_by_default(self) -> None:
+        old_key = os.environ.get("AI_RELAY_API_KEY")
+        old_base_url = os.environ.get("AI_RELAY_BASE_URL")
+        os.environ["AI_RELAY_API_KEY"] = "existing"
+        os.environ.pop("AI_RELAY_BASE_URL", None)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, ".env")
+                with open(path, "w", encoding="utf-8") as file:
+                    file.write("AI_RELAY_API_KEY=from-file\nAI_RELAY_BASE_URL=https://relay.example.com\n")
+                loaded = m.load_dotenv(path)
+            self.assertEqual(os.environ["AI_RELAY_API_KEY"], "existing")
+            self.assertNotIn("AI_RELAY_API_KEY", loaded)
+            self.assertEqual(loaded["AI_RELAY_BASE_URL"], "https://relay.example.com")
+        finally:
+            if old_key is None:
+                os.environ.pop("AI_RELAY_API_KEY", None)
+            else:
+                os.environ["AI_RELAY_API_KEY"] = old_key
+            if old_base_url is None:
+                os.environ.pop("AI_RELAY_BASE_URL", None)
+            else:
+                os.environ["AI_RELAY_BASE_URL"] = old_base_url
+
+
+class CompareReportTest(unittest.TestCase):
+    def _report(self, score: float = 80.0, status: str = "ok") -> dict[str, object]:
+        return {
+            "summary": [
+                {
+                    "model": "gpt-4o",
+                    "capability": score,
+                    "availability": 100.0 if status == "ok" else 0.0,
+                    "rating": m.overall_rating(score if status == "ok" else None, 100.0 if status == "ok" else 0.0),
+                    "authenticity": "未发现不一致" if status == "ok" else "无法判断",
+                }
+            ],
+            "models": {
+                "gpt-4o": [
+                    {
+                        "probe_id": "p",
+                        "title": "p",
+                        "category": "universal",
+                        "weight": 10,
+                        "status": status,
+                        "score": score,
+                    }
+                ]
+            },
+        }
+
+    def test_compare_reports_detects_score_delta(self) -> None:
+        comparison = m.compare_reports(self._report(80), self._report(90))
+        self.assertEqual(comparison["added_models"], [])
+        changed = comparison["changed_models"]
+        self.assertEqual(changed[0]["model"], "gpt-4o")
+        self.assertEqual(changed[0]["capability_delta"], 10.0)
+        self.assertEqual(changed[0]["probe_changes"][0]["score_delta"], 10.0)
+
+    def test_compare_reports_detects_added_model(self) -> None:
+        baseline = {"summary": [], "models": {}}
+        comparison = m.compare_reports(baseline, self._report(80))
+        self.assertEqual(comparison["added_models"], ["gpt-4o"])
+
+    def test_format_comparison_markdown(self) -> None:
+        comparison = m.compare_reports(self._report(80), self._report(90))
+        markdown = m.format_comparison_markdown(comparison)
+        self.assertIn("## Baseline Comparison", markdown)
+        self.assertIn("+10.0", markdown)
+
+    def test_load_report_json_validates_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "bad.json")
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump({"no_models": {}}, file)
+            with self.assertRaises(ValueError):
+                m.load_report_json(path)
+
+
+class ProbeConfigTest(unittest.TestCase):
+    def _config_path(self, tmpdir: str, scorer: str = "json_contract") -> str:
+        path = os.path.join(tmpdir, "probes.json")
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "probes": [
+                        {
+                            "probe_id": "custom_json",
+                            "title": "Custom JSON",
+                            "category": "universal",
+                            "weight": 5,
+                            "families": ["unknown", "gpt", "claude"],
+                            "system": "Return JSON.",
+                            "user": "Return JSON.",
+                            "scorer": scorer,
+                        }
+                    ]
+                },
+                file,
+            )
+        return path
+
+    def test_scorer_registry_covers_default_probes(self) -> None:
+        self.assertTrue(all(probe.scorer_id for probe in m.build_probes()))
+
+    def test_load_probe_config_maps_scorer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            probes = m.load_probe_config(self._config_path(tmpdir))
+        self.assertEqual(probes[0].probe_id, "custom_json")
+        self.assertEqual(probes[0].scorer_id, "json_contract")
+        self.assertIs(probes[0].scorer, m.score_json_contract)
+
+    def test_unknown_scorer_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(ValueError) as ctx:
+                m.load_probe_config(self._config_path(tmpdir, "missing"))
+        self.assertIn("unknown scorer", str(ctx.exception))
+
+    def test_applicable_probes_uses_external_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            probes = m.applicable_probes("gpt-4o", False, self._config_path(tmpdir))
+        self.assertEqual([probe.probe_id for probe in probes], ["custom_json"])
 
 
 class ValidateFieldTest(unittest.TestCase):
