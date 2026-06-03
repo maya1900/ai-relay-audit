@@ -414,7 +414,7 @@ class AuditConfigTest(unittest.TestCase):
         self.assertEqual(cfg.api.base_url, "https://x.com")
         self.assertEqual(cfg.models, ["a", "b", "c"])
         self.assertEqual(cfg.output_dir, "out")
-        self.assertTrue(cfg.save_report)  # CLI/wizard 默认写报告
+        self.assertTrue(cfg.save_report)
 
     def test_defaults_when_attrs_missing(self) -> None:
         cfg = m.AuditConfig.from_namespace(argparse.Namespace(base_url=None, api_key=None))
@@ -507,6 +507,12 @@ class RunEstimateTest(unittest.TestCase):
         lines = m.format_run_estimate(estimate)
         self.assertTrue(any("Estimated official cost upper bound:" in line for line in lines))
 
+    def test_format_run_estimate_includes_output_dir(self) -> None:
+        cfg = m.AuditConfig(make_config(), ["gpt-5.5"], None, None, False, False, "reports", False)
+        estimate = m.build_run_estimate(cfg, cfg.models)
+        lines = m.format_run_estimate(estimate, cfg.output_dir, cfg.save_report)
+        self.assertTrue(any(line.startswith("Output dir: ") for line in lines))
+
 
 class DecisionSummaryTest(unittest.TestCase):
     def test_normal_model_summary(self) -> None:
@@ -519,6 +525,12 @@ class DecisionSummaryTest(unittest.TestCase):
         rows = m.build_decision_summary({"gpt-4o": [make_result(status="error", score=0)]})
         self.assertIsNone(rows[0]["capability"])
         self.assertIn("Do not use", rows[0]["recommendation"])
+
+    def test_severe_issues_are_json_serializable(self) -> None:
+        result = make_result("universal_reasoning", "universal", 15, "ok", 0)
+        rows = m.build_decision_summary({"gpt-4o": [result]})
+        json.dumps(rows)
+        self.assertEqual(rows[0]["severe_issues"][0]["probe_id"], "universal_reasoning")
 
 
 class ReportOutputTest(unittest.TestCase):
@@ -536,8 +548,36 @@ class ReportOutputTest(unittest.TestCase):
         self.assertIn("models", data)
         self.assertIn("gpt-4o", data["models"])
 
+    def test_write_reports_handles_severe_issues(self) -> None:
+        result = make_result("universal_reasoning", "universal", 15, "ok", 0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            md_path, json_path = m.write_reports(tmpdir, {"gpt-4o": [result]}, make_config())
+            self.assertTrue(os.path.exists(md_path))
+            with open(json_path, encoding="utf-8") as file:
+                data = json.load(file)
+        self.assertEqual(data["summary"][0]["severe_issues"][0]["probe_id"], "universal_reasoning")
+
 
 class TuiSaveTest(unittest.TestCase):
+    def test_save_latest_report_writes_unsaved_completed_report(self) -> None:
+        app = m.TuiApp.__new__(m.TuiApp)
+        app.language = "zh"
+        app.logs = []
+        app.log_scroll = 0
+        app.last_saved_paths = None
+        app.last_model_results = {"gpt-4o": [make_result(score=90)]}
+        app.last_report_config = make_config()
+        app.last_report_output_dir = "reports"
+        app.last_report_unsaved = True
+
+        with mock.patch("relay_audit.tui.write_reports", return_value=("new.md", "new.json")) as write_reports:
+            app.save_latest_report()
+
+        write_reports.assert_called_once()
+        self.assertEqual(app.last_saved_paths, ("new.md", "new.json"))
+        self.assertFalse(app.last_report_unsaved)
+        self.assertIn("报告已保存", app.logs)
+
     def test_save_latest_report_does_not_write_again_when_already_saved(self) -> None:
         app = m.TuiApp.__new__(m.TuiApp)
         app.language = "zh"
@@ -549,11 +589,91 @@ class TuiSaveTest(unittest.TestCase):
         app.last_report_output_dir = "reports"
         app.last_report_unsaved = False
 
-        with mock.patch.object(m, "write_reports", side_effect=AssertionError("should not write")):
+        with mock.patch("relay_audit.tui.write_reports", side_effect=AssertionError("should not write")):
             app.save_latest_report()
 
         self.assertIn("报告已保存过。", app.logs)
         self.assertIn("Markdown: old.md", app.logs)
+
+
+class TuiKeyTest(unittest.TestCase):
+    def test_x_clears_live_logs_only(self) -> None:
+        app = m.TuiApp.__new__(m.TuiApp)
+        app.logs = ["one", "two"]
+        app.log_scroll = 3
+        app.view_mode = "report"
+        app.worker = None
+        app.detail_items = [{"title": "detail"}]
+        app.error_items = [{"title": "error"}]
+
+        self.assertTrue(app.handle_key(ord("x")))
+
+        self.assertEqual(app.logs, [])
+        self.assertEqual(app.log_scroll, 0)
+        self.assertEqual(app.detail_items, [{"title": "detail"}])
+        self.assertEqual(app.error_items, [{"title": "error"}])
+
+    def test_arrow_keys_move_config_selection(self) -> None:
+        app = m.TuiApp.__new__(m.TuiApp)
+        calls: list[int] = []
+        app.worker = None
+        app.selected = 4
+        app.fields = [("a", "A"), ("b", "B"), ("c", "C"), ("d", "D"), ("e", "E")]
+        app.scroll_log = calls.append  # type: ignore[method-assign]
+
+        self.assertTrue(app.handle_key(m.curses.KEY_DOWN))
+        self.assertEqual(app.selected, 0)
+        self.assertEqual(calls, [])
+
+    def test_confirm_run_popup_formats_known_cost_in_chinese(self) -> None:
+        class FakeStdScr:
+            def getmaxyx(self) -> tuple[int, int]:
+                return (40, 100)
+
+        class FakeWin:
+            def keypad(self, value: bool) -> None:
+                self.keypad_enabled = value
+
+            def erase(self) -> None:
+                pass
+
+            def border(self) -> None:
+                pass
+
+            def addstr(self, *_args: object) -> None:
+                pass
+
+            def refresh(self) -> None:
+                pass
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (20, 80)
+
+            def getch(self) -> int:
+                return 10
+
+        app = m.TuiApp.__new__(m.TuiApp)
+        app.stdscr = FakeStdScr()
+        app.language = "zh"
+        app.state = {
+            "base_url": "https://relay.example.com",
+            "api_key": "sk",
+            "model": "gpt-5.5",
+            "model_filter": "",
+            "limit": "",
+            "timeout": "30",
+            "max_tokens": "900",
+            "temperature": "0",
+            "api_style": "auto",
+            "mode": "standard",
+            "output_dir": "reports",
+            "save_report": False,
+            "all_targeted": False,
+            "hide_prompts": False,
+        }
+
+        with mock.patch.object(m.curses, "newwin", return_value=FakeWin()):
+            self.assertTrue(app.confirm_run_popup())
 
 
 class ErrorSuggestionTest(unittest.TestCase):
@@ -661,7 +781,12 @@ class CompareReportTest(unittest.TestCase):
 
 
 class ProbeConfigTest(unittest.TestCase):
-    def _config_path(self, tmpdir: str, scorer: str = "json_contract") -> str:
+    def _config_path(
+        self,
+        tmpdir: str,
+        scorer: str = "json_contract",
+        families: list[str] | None = None,
+    ) -> str:
         path = os.path.join(tmpdir, "probes.json")
         with open(path, "w", encoding="utf-8") as file:
             json.dump(
@@ -672,7 +797,7 @@ class ProbeConfigTest(unittest.TestCase):
                             "title": "Custom JSON",
                             "category": "universal",
                             "weight": 5,
-                            "families": ["unknown", "gpt", "claude"],
+                            "families": families or ["unknown", "gpt", "claude"],
                             "system": "Return JSON.",
                             "user": "Return JSON.",
                             "scorer": scorer,
@@ -704,6 +829,11 @@ class ProbeConfigTest(unittest.TestCase):
             probes = m.applicable_probes("gpt-4o", False, self._config_path(tmpdir))
         self.assertEqual([probe.probe_id for probe in probes], ["custom_json"])
 
+    def test_external_config_accepts_gemini_family(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            probes = m.applicable_probes("gemini-2.0-flash", False, self._config_path(tmpdir, families=["gemini"]))
+        self.assertEqual([probe.probe_id for probe in probes], ["custom_json"])
+
 
 class ValidateFieldTest(unittest.TestCase):
     def test_timeout_positive_int(self) -> None:
@@ -724,6 +854,12 @@ class ValidateFieldTest(unittest.TestCase):
 
     def test_free_text_has_no_validator(self) -> None:
         self.assertIsNone(m.validate_field("base_url", "whatever"))
+
+
+class DisplayWidthTest(unittest.TestCase):
+    def test_pad_display_keeps_wide_text_width(self) -> None:
+        text = m.pad_display("中转站地址", 18)
+        self.assertEqual(m.display_width(text), 18)
 
 
 class ConsoleReporterTest(unittest.TestCase):

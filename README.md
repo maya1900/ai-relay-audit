@@ -1,6 +1,6 @@
 # AI Relay Audit
 
-一个用于检测 AI 中转站模型接口的命令行脚本，重点覆盖 GPT/Claude 模型的：
+一个用于检测 AI 中转站模型接口的终端 TUI 工具，重点覆盖 GPT/Claude 模型的：
 
 - 模型列表获取：从 OpenAI 兼容 `/v1/models` 自动提取，或手动输入模型 ID。
 - 通用能力检测：结构化输出、多约束推理、提示注入抵抗、代码任务。
@@ -14,7 +14,7 @@
 
 - Python 3.10 及以上（脚本使用了 `X | Y`、`tuple[...]` 等类型注解语法）。
 - 核心功能仅依赖 Python 标准库，无需安装第三方包。
-- TUI 模式依赖 `curses`：macOS / Linux 自带；Windows 标准发行版不含，可执行 `pip install windows-curses` 启用，或改用下文的命令行 / `--wizard` 模式。
+- TUI 模式依赖 `curses`：macOS / Linux 自带；Windows 标准发行版不含，可执行 `pip install windows-curses` 启用。
 
 ## 快速开始
 
@@ -33,15 +33,16 @@ python3 ai_relay_audit.py --tui
 
 TUI 操作：
 
-- `Tab` / 方向键：切换字段
+- `Tab` / `Shift+Tab` / 方向键：切换字段
 - `Enter`：编辑字段或切换复选项（Timeout / Max tokens / Temperature / Limit 等数值字段即时校验，非法值无法保存）
 - `F5`：按当前 Base URL、API Key 拉取模型列表，应用 `Model filter` / `Limit` 后弹窗选择一个模型；弹窗内可直接打字搜索，`Backspace` 删除，`Ctrl+U` 清空
 - `F9`：开始检测当前 `Model`；真正运行前会显示模型数、请求数、最大输出 token 暴露和保存状态，`Enter` 确认，`Esc` 取消
 - `l` / `r` / `d` / `e`：切换右侧视图为实时日志 / 完整报告 / 探针详情 / 错误建议
 - `s`：检测完成后，如果报告尚未保存，一键保存最近一次 Markdown / JSON 报告
+- `x`：清空实时日志（不删除已生成的报告、探针详情和错误记录）
 - `g`：切换中英文界面
 - `Esc` / `c`：取消正在进行的检测（当前探针结束后停止，已完成部分仍会出报告）
-- 鼠标滚轮 / `PageUp` / `PageDown`：滚动当前右侧视图
+- `PageUp` / `PageDown`：滚动当前右侧视图
 - `Home` / `End`：跳到当前右侧视图顶部 / 底部
 - `q`：退出（检测进行中需先取消）
 
@@ -71,13 +72,7 @@ TUI 检测完成后会直接把 Markdown 报告展示在右侧日志里。默认
 
 很多中转站虽然模型名是 Claude，但仍然做成 OpenAI 兼容接口；也有站点对 GPT 新模型只重点支持 `/v1/responses`。Gemini 模型的中转站可能使用原生 Gemini API 或 OpenAI 兼容接口。
 
-也可以使用一步一步输入的向导：
-
-```bash
-python3 ai_relay_audit.py --wizard
-```
-
-或者直接用命令行参数运行。脚本会自动读取当前目录的 `.env`（不会覆盖已经存在的环境变量），也可以继续手动 `export`：
+脚本会自动读取当前目录的 `.env`（不会覆盖已经存在的环境变量），也可以在 TUI 里手动填写：
 
 ```bash
 cd ai-relay-audit
@@ -86,88 +81,29 @@ cp example.env .env
 python3 ai_relay_audit.py
 ```
 
-```bash
-cd ai-relay-audit
-export AI_RELAY_API_KEY="sk-..."
-python3 ai_relay_audit.py --base-url "https://your-relay.example.com"
-```
+如果中转站 base URL 已经带 `/v1`，直接填入也可以，工具会自动归一化。
 
-如果中转站 base URL 已经带 `/v1` 也可以：
-
-```bash
-python3 ai_relay_audit.py --base-url "https://your-relay.example.com/v1"
-```
-
-## 手动指定模型
-
-```bash
-python3 ai_relay_audit.py \
-  --base-url "https://your-relay.example.com" \
-  --models "gpt-4o,claude-3-5-sonnet-20241022"
-```
-
-## 从模型接口筛选
-
-只检测名字里包含 `gpt` 或 `claude` 的前 5 个模型：
-
-```bash
-python3 ai_relay_audit.py \
-  --base-url "https://your-relay.example.com" \
-  --model-filter "(gpt|claude)" \
-  --limit 5
-```
-
-## 常用参数
+## 常用字段
 
 ```text
---base-url        中转站地址，支持带或不带 /v1；也可用环境变量 / .env 里的 AI_RELAY_BASE_URL
---api-key         API key；也可用环境变量 / .env 里的 AI_RELAY_API_KEY
---tui             启动全屏终端界面
---wizard          启动一步一步输入向导
---models          逗号分隔的模型 ID；省略时自动请求 /v1/models
---model-filter    拉取模型列表后的正则筛选
---limit           限制检测模型数量
---all-targeted    对每个模型都运行 GPT 和 Claude 针对性探针
---hide-prompts    不打印完整提示词，只打印结果过程
---output-dir      报告输出目录，默认 reports
---baseline        运行本次检测后，与一个历史 audit_report_*.json 做 baseline 对比
---compare-only    不触网，直接对比两个历史 JSON 报告
---probes-config   使用外部 JSON 探针配置；scorer 只能引用内置评分器 ID
---timeout         请求超时秒数，默认 90
---max-tokens      每次检测最大输出 token，默认 900
---temperature     默认 0
---api-style       auto/openai-responses/openai-chat/anthropic，默认 auto
+Base URL           中转站地址，支持带或不带 /v1；也可用 .env 里的 AI_RELAY_BASE_URL
+API Key            API key；也可用 .env 里的 AI_RELAY_API_KEY
+Model              单个模型 ID；可手动输入，或按 F5 从 /v1/models 选择
+Model filter       拉取模型列表后的正则筛选
+Limit              限制模型选择列表数量
+Save report file   检测完成后自动保存报告；关闭时可完成后按 s 手动保存
+All targeted probes 对当前模型运行 GPT 和 Claude 两类针对性探针
+Hide prompts       不在实时日志打印完整提示词
+Output dir         报告输出目录，默认 reports
+Timeout            请求超时秒数，默认 90
+Max tokens         每次检测最大输出 token，默认 900
+Temperature        默认 0
+API style          auto/openai-responses/openai-chat/anthropic/gemini，默认 auto
 ```
-
-## 报告对比 / baseline
-
-如果想长期跟踪同一个中转站的质量变化，可以把上一次 JSON 报告作为 baseline：
-
-```bash
-python3 ai_relay_audit.py \
-  --base-url "https://your-relay.example.com" \
-  --models "gpt-4o" \
-  --baseline reports/audit_report_20260101_120000.json
-```
-
-也可以不触网，只对比两个已经保存的 JSON：
-
-```bash
-python3 ai_relay_audit.py --compare-only old.json new.json
-```
-
-对比会按模型 ID 和 `probe_id` 匹配，报告新增/移除模型、能力分/可用性/评级/真实性变化，以及单个探针的状态和分数变化。
 
 ## 外部探针配置
 
-默认探针仍然内置在脚本里。需要实验性自定义探针时，可传入 JSON：
-
-```bash
-python3 ai_relay_audit.py \
-  --base-url "https://your-relay.example.com" \
-  --models "gpt-4o" \
-  --probes-config probes.json
-```
+默认探针仍然内置在脚本里。代码内部保留外部探针 JSON 加载能力；TUI 当前不暴露该入口。
 
 配置示例：
 
@@ -179,7 +115,7 @@ python3 ai_relay_audit.py \
       "title": "Custom JSON check",
       "category": "universal",
       "weight": 10,
-      "families": ["unknown", "gpt", "claude"],
+      "families": ["unknown", "gpt", "claude", "gemini"],
       "system": "Return only JSON.",
       "user": "Return {\"ok\": true}.",
       "scorer": "json_contract"
@@ -262,10 +198,36 @@ python3 ai_relay_audit.py \
 
 Markdown 适合人工查看，JSON 适合后续自动分析或归档。
 
+## 项目结构
+
+```text
+ai_relay_audit.py        兼容入口，启动 TUI 并 re-export 公共 API
+relay_audit/api.py      OpenAI / Anthropic / Gemini 请求适配
+relay_audit/probes.py   内置探针和外部探针配置加载
+relay_audit/scoring.py  各类评分器和模型家族识别
+relay_audit/reporting.py 报告、评分汇总、baseline 对比
+relay_audit/reporters.py 审计过程输出适配
+relay_audit/tui.py      curses TUI
+relay_audit/runner.py   审计主流程和入口参数
+```
+
+## 端到端验收
+
+`reports/` 目录中保留了本地真实中转站运行生成的 Markdown / JSON 报告，可用于确认工具已跑过端到端流程。真实凭据不会提交到仓库；更换中转站或大改 API 适配后建议再人工跑一次：
+
+1. 启动 TUI：`python3 ai_relay_audit.py`
+2. 填写 Base URL / API Key，按 `F5` 拉取模型。
+3. 选择一个 GPT 或 Claude 模型，`Mode` 先用 `quick` 跑通。
+4. 切到 `standard` 再跑一次，确认报告页、详情页、错误页都能查看。
+5. 关闭 `Save report file` 跑完后按 `s`，确认 `reports/audit_report_*.md` 和 `.json` 写入成功。
+
 ## 测试
 
 评分逻辑由单元测试覆盖（纯函数，不联网）：
 
 ```bash
+python3 -m py_compile ai_relay_audit.py relay_audit/*.py test_ai_relay_audit.py
 python3 -m unittest test_ai_relay_audit -v
 ```
+
+GitHub Actions 会在 Python 3.10、3.11、3.12 上运行同样的编译和单元测试。
