@@ -231,3 +231,7 @@ python3 -m unittest test_ai_relay_audit -v
 ```
 
 GitHub Actions 会在 Python 3.10、3.11、3.12 上运行同样的编译和单元测试。
+
+## 许可证
+
+本项目基于 Apache License 2.0 发布，详见 [LICENSE](LICENSE)。
