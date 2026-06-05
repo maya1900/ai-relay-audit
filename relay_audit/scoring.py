@@ -198,31 +198,40 @@ def score_claude_thinking_signature(text: str, response_data: dict[str, Any] | N
     if response_data is None:
         return 0, "未获取到完整响应数据"
 
-    # 检查 content 中是否有 thinking 块
+    # 检查 content 中是否有 thinking / redacted_thinking 块
     content = response_data.get("content", [])
     if not isinstance(content, list):
         return 0, "响应格式异常：content 不是列表"
 
-    thinking_blocks = [item for item in content if isinstance(item, dict) and item.get("type") == "thinking"]
+    thinking_blocks = [
+        item
+        for item in content
+        if isinstance(item, dict) and item.get("type") in {"thinking", "redacted_thinking"}
+    ]
     if not thinking_blocks:
-        return 0, "未触发 thinking：响应中无 thinking 块（可能中转站不支持或剥离了 thinking）"
+        return 0, "未触发 thinking：响应中无 thinking/redacted_thinking 块（可能中转站不支持或剥离了 thinking）"
 
     # 检查 signature 字段
     signatures = []
+    redacted_payloads = []
     for block in thinking_blocks:
         sig = block.get("signature")
         if sig and isinstance(sig, str):
             signatures.append(sig)
+        data = block.get("data")
+        if block.get("type") == "redacted_thinking" and data and isinstance(data, str):
+            redacted_payloads.append(data)
 
-    if not signatures:
-        return 0, f"发现 {len(thinking_blocks)} 个 thinking 块，但均无 signature 字段（疑似非官方 Claude 或中转站剥离签名）"
+    if not signatures and not redacted_payloads:
+        return 0, f"发现 {len(thinking_blocks)} 个 thinking/redacted_thinking 块，但均无 signature 或 data 字段（疑似非官方 Claude 或中转站剥离签名）"
 
-    # 验证签名格式：应该是长度 500-2000 的字符串
-    sig = signatures[0]
+    # 验证签名格式：应该是长度 500-3000 的字符串；redacted_thinking 的 data 是加密载荷，也可作为有效证据。
+    sig = signatures[0] if signatures else redacted_payloads[0]
     sig_len = len(sig)
+    label = "thinking signature" if signatures else "redacted_thinking 加密数据"
 
     checks = [
-        ("signature_exists", True),
+        ("signature_or_redacted_data_exists", True),
         ("length_valid", 500 <= sig_len <= 3000),  # 放宽到 3000，以适应不同版本
         ("non_trivial", sig_len >= 100 and not sig.strip() in {"", "null", "none", "N/A"}),
         ("appears_encoded", any(c in sig for c in "abcdefABCDEF0123456789+/=")),  # 看起来像 base64 或十六进制
@@ -234,95 +243,141 @@ def score_claude_thinking_signature(text: str, response_data: dict[str, Any] | N
     details = f"签名长度={sig_len}；" + "；".join(f"{name}={'通过' if ok else '未通过'}" for name, ok in checks)
 
     if score >= 75:
-        return score, f"检测到有效 thinking signature（{details}）- 极大概率为真实 Claude 官方后端"
+        return score, f"检测到有效 {label}（{details}）- 极大概率为真实 Claude 官方后端"
     elif score >= 50:
-        return score, f"检测到可疑 signature（{details}）- 格式异常，需人工复核"
+        return score, f"检测到可疑 {label}（{details}）- 格式异常，需人工复核"
     else:
-        return score, f"signature 无效（{details}）"
+        return score, f"{label} 无效（{details}）"
 
 
-def analyze_usage_fingerprint(usage: dict[str, Any] | None, expected_family: str) -> tuple[bool, list[str]]:
-    """分析 usage 字段中的协议指纹，检测是否存在异源痕迹。
+def _usage_protocol(api_style: str, usage: dict[str, Any], expected_family: str) -> str:
+    """把 API style 归一到 usage 形态，而不是按模型家族猜字段。"""
+    style = (api_style or "auto").lower()
+    aliases = {"openai": "openai-chat", "responses": "openai-responses", "google": "gemini"}
+    style = aliases.get(style, style)
+    if style in {"openai-chat", "openai-responses", "anthropic", "gemini"}:
+        return style
 
-    返回: (has_issues, issues_list)
-    - has_issues: 是否发现严重问题（协议转换/模型替换迹象）
-    - issues_list: 具体问题列表
+    keys = set(usage)
+    if {"prompt_tokens", "completion_tokens"} <= keys:
+        return "openai-chat"
+    if {"input_tokens", "output_tokens"} <= keys:
+        return "anthropic" if expected_family == "claude" else "openai-responses"
+    return "unknown"
+
+
+def _required_usage_keys(protocol: str) -> tuple[str, ...]:
+    if protocol in {"openai-chat", "gemini"}:
+        return ("prompt_tokens", "completion_tokens", "total_tokens")
+    if protocol == "openai-responses":
+        return ("input_tokens", "output_tokens", "total_tokens")
+    if protocol == "anthropic":
+        return ("input_tokens", "output_tokens")
+    return ()
+
+
+def _nonneg_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def analyze_usage_fingerprint(
+    usage: dict[str, Any] | None,
+    expected_family: str,
+    api_style: str = "auto",
+) -> tuple[float, list[str]]:
+    """分析 usage 字段中的协议指纹，返回分数和问题列表。
+
+    关键口径：usage 字段应按实际 wire API 判断。OpenAI Responses 官方使用
+    input_tokens/output_tokens，Anthropic 官方也使用 input_tokens/output_tokens；
+    只有明确的异源残留（如 claude_*、gemini_*、usage_source 指向其他供应商）
+    才是严重问题。
     """
     if not usage or not isinstance(usage, dict):
-        return False, []
+        return 50.0, ["未获取到 usage 字段，无法进行协议指纹分析（部分中转站不返回 usage）"]
 
-    issues: list[str] = []
+    protocol = _usage_protocol(api_style, usage, expected_family)
+    issues: list[tuple[str, str]] = []
+    keys = set(usage)
+    required = _required_usage_keys(protocol)
 
-    # Anthropic 特有字段（应该只在 Claude 请求中出现）
-    anthropic_fields = [
-        "input_tokens",  # Anthropic 用 input_tokens，OpenAI 用 prompt_tokens
-        "output_tokens",  # Anthropic 用 output_tokens，OpenAI 用 completion_tokens
-        "claude_cache_creation_5_m_tokens",
-        "claude_cache_read_5_m_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-    ]
+    for key in required:
+        if key not in usage:
+            issues.append(("major", f"{protocol} usage 缺少必需字段 {key}"))
+        elif not _nonneg_int(usage.get(key)):
+            issues.append(("major", f"{protocol} usage 字段 {key} 不是非负整数"))
 
-    # OpenAI 特有字段（应该只在 GPT 请求中出现）
-    openai_fields = [
-        "prompt_tokens",
-        "completion_tokens",
-        "prompt_tokens_details",
-        "completion_tokens_details",
-    ]
+    if "total_tokens" in required and all(_nonneg_int(usage.get(k)) for k in required):
+        left_key, right_key, total_key = required
+        expected_total = int(usage[left_key]) + int(usage[right_key])
+        if usage[total_key] != expected_total:
+            issues.append(("minor", f"total_tokens={usage[total_key]} 与 {left_key}+{right_key}={expected_total} 不一致"))
 
-    # 检查协议不一致
-    if expected_family == "gpt":
-        # GPT 请求中出现 Anthropic 字段 = 协议转换
-        found_anthropic = [field for field in anthropic_fields if field in usage]
-        if found_anthropic:
-            issues.append(f"GPT 请求的 usage 中出现 Anthropic 字段 {found_anthropic}，疑似中转站用 Claude 后端替换")
+    source = usage.get("usage_source")
+    if isinstance(source, str):
+        normalized_source = source.strip().lower()
+        allowed_sources = {
+            "openai-chat": {"", "openai"},
+            "openai-responses": {"", "openai"},
+            "anthropic": {"", "anthropic", "claude"},
+            "gemini": {"", "gemini", "google"},
+            "unknown": {""},
+        }.get(protocol, {""})
+        if normalized_source not in allowed_sources:
+            issues.append(("critical", f"usage_source={source!r} 与当前 {protocol} 协议不一致"))
 
-        # 检查是否有明确的来源标记
-        if usage.get("usage_source") == "anthropic":
-            issues.append("usage_source 标记为 anthropic，确认中转站在做协议转换")
+    claude_keys = sorted(k for k in keys if k.startswith("claude_"))
+    gemini_keys = sorted(
+        k for k in keys
+        if k.startswith("gemini_") or k in {
+            "cached_content_token_count",
+            "candidates_token_count",
+            "prompt_token_count",
+            "total_token_count",
+            "tool_use_prompt_token_count",
+        }
+    )
 
-    elif expected_family == "claude":
-        # Claude 请求中出现 OpenAI 字段（但有 input/output_tokens）可能是适配层
-        has_anthropic_style = "input_tokens" in usage or "output_tokens" in usage
-        found_openai = [field for field in openai_fields if field in usage]
+    if protocol in {"openai-chat", "openai-responses"}:
+        if claude_keys:
+            issues.append(("critical", f"OpenAI usage 中出现 Claude 残留字段 {claude_keys}"))
+        if gemini_keys:
+            issues.append(("critical", f"OpenAI usage 中出现 Gemini 残留字段 {gemini_keys}"))
+        cache_keys = sorted(keys & {"cache_creation_input_tokens", "cache_read_input_tokens"})
+        if cache_keys:
+            issues.append(("major", f"OpenAI usage 中出现 Anthropic cache 字段 {cache_keys}"))
 
-        if found_openai and not has_anthropic_style:
-            issues.append(f"Claude 请求的 usage 只有 OpenAI 字段 {found_openai}，疑似中转站用其他模型替换")
+    if protocol == "openai-chat":
+        mixed = sorted(keys & {"input_tokens", "output_tokens", "input_tokens_details", "output_tokens_details"})
+        if mixed:
+            issues.append(("minor", f"Chat Completions usage 混入 input/output token 字段 {mixed}"))
+    elif protocol in {"openai-responses", "anthropic"}:
+        mixed = sorted(keys & {"prompt_tokens", "completion_tokens", "prompt_tokens_details", "completion_tokens_details"})
+        if mixed:
+            issues.append(("minor", f"{protocol} usage 混入 prompt/completion token 字段 {mixed}"))
 
-    # 检查异常字段（既不是 OpenAI 也不是 Anthropic 的标准字段）
-    known_fields = {
-        "input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens",
-        "cache_creation_input_tokens", "cache_read_input_tokens",
-        "claude_cache_creation_5_m_tokens", "claude_cache_read_5_m_tokens",
-        "prompt_tokens_details", "completion_tokens_details",
-        "usage_source",  # 某些中转站添加的标记字段
-    }
-    unknown_fields = [k for k in usage.keys() if k not in known_fields]
-    if unknown_fields:
-        issues.append(f"发现非标准 usage 字段 {unknown_fields}，可能为中转站自定义或第三方适配层")
+    severity_penalty = {"critical": 35.0, "major": 15.0, "minor": 5.0}
+    score = max(0.0, 100.0 - sum(severity_penalty[severity] for severity, _ in issues))
+    if any(severity == "critical" for severity, _ in issues):
+        score = min(score, 25.0)
 
-    has_issues = len(issues) > 0
-    return has_issues, issues
+    if not issues:
+        return score, [f"usage 字段符合 {protocol} 协议形态，未发现异源残留"]
+    return score, [f"{severity}: {message}" for severity, message in issues]
 
 
-def score_protocol_fingerprint(text: str, usage: dict[str, Any] | None = None, expected_family: str = "unknown") -> tuple[float, str]:
+def score_protocol_fingerprint(
+    text: str,
+    usage: dict[str, Any] | None = None,
+    expected_family: str = "unknown",
+    api_style: str = "auto",
+) -> tuple[float, str]:
     """检测协议指纹，识别中转站是否做了协议转换。
 
     这个探针不需要特殊的 prompt，主要分析 usage 字段。
     """
-    if not usage:
-        return 50, "未获取到 usage 字段，无法进行协议指纹分析（部分中转站不返回 usage）"
-
-    has_issues, issues = analyze_usage_fingerprint(usage, expected_family)
-
-    if has_issues:
-        score = 0
-        reason = "发现严重协议异常：" + "；".join(issues)
-    else:
-        score = 100
-        reason = f"usage 字段符合 {expected_family} 协议规范，未发现异源痕迹"
-
+    score, issues = analyze_usage_fingerprint(usage, expected_family, api_style)
+    prefix = "协议指纹正常" if score >= 90 else "协议指纹存在偏差"
+    reason = f"{prefix}（api_style={api_style}，family={expected_family}）：{'；'.join(issues)}"
     return score, reason
 
 

@@ -21,6 +21,7 @@ def run_probe(
     try:
         response_data: dict[str, Any] | None = None
         family = family_for_model(model)
+        actual_api_style = normalize_api_style(config.api_style)
 
         # 特殊处理 thinking signature 探针：需要调用带 thinking 参数的 Anthropic API
         if probe.probe_id == "claude_thinking_signature":
@@ -65,12 +66,14 @@ def run_probe(
         else:
             # 常规探针使用标准 chat 函数
             response, usage, latency_ms = chat(config, model, probe.system, probe.user)
+            if actual_api_style == "auto":
+                actual_api_style = config.resolved_styles.get(model, "auto")
 
         # 调用评分器
         if probe.probe_id == "claude_thinking_signature":
             score, reason = probe.scorer(response, response_data)
         elif probe.probe_id == "protocol_fingerprint":
-            score, reason = probe.scorer(response, usage, family)
+            score, reason = probe.scorer(response, usage, family, actual_api_style)
         elif probe.probe_id == "stream_consistency":
             score, reason = probe.scorer(response, stream_response, non_stream_response)
         else:

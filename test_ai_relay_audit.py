@@ -58,6 +58,28 @@ def make_config(api_key: str = "sk-test") -> m.ApiConfig:
     )
 
 
+class FakeHTTPResponse:
+    def __init__(self, body: dict[str, object]) -> None:
+        self.body = body
+
+    def read(self) -> bytes:
+        return json.dumps(self.body).encode("utf-8")
+
+    def __enter__(self) -> "FakeHTTPResponse":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+
+def request_json(request: object) -> dict[str, object]:
+    data = getattr(request, "data", None)
+    if not data:
+        return {}
+    parsed = json.loads(data.decode("utf-8"))
+    return parsed if isinstance(parsed, dict) else {}
+
+
 class NormalizeBaseUrlTest(unittest.TestCase):
     def test_strips_trailing_slash_and_v1(self) -> None:
         self.assertEqual(m.normalize_base_url("https://x.com/v1"), "https://x.com")
@@ -97,6 +119,144 @@ class ApiStyleTest(unittest.TestCase):
         self.assertEqual(m.normalize_api_style("gemini"), "gemini")
         self.assertEqual(m.normalize_api_style("google"), "gemini")
         self.assertEqual(m.normalize_api_style("gemini"), "gemini")
+
+
+class ApiRequestTest(unittest.TestCase):
+    def test_api_request_prefixes_unversioned_paths_only(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({"ok": True})
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            m.api_request(make_config(), "GET", "/models")
+            m.api_request(make_config(), "POST", "/v1/models/gemini:generateContent?key=sk-test", {})
+
+        self.assertEqual(requests[0].full_url, "https://relay.example.com/v1/models")
+        self.assertEqual(requests[1].full_url, "https://relay.example.com/v1/models/gemini:generateContent?key=sk-test")
+
+    def test_chat_openai_payload(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            text, usage, _latency = m.chat_openai(make_config(), "gpt-4o", "sys", "user")
+
+        payload = request_json(requests[0])
+        headers = {k.lower(): v for k, v in requests[0].header_items()}
+        self.assertEqual(text, "ok")
+        self.assertEqual(usage["total_tokens"], 2)
+        self.assertEqual(requests[0].full_url, "https://relay.example.com/v1/chat/completions")
+        self.assertEqual(payload["model"], "gpt-4o")
+        self.assertEqual(payload["max_tokens"], 900)
+        self.assertEqual(payload["temperature"], 0.0)
+        self.assertEqual(headers["authorization"], "Bearer sk-test")
+
+    def test_chat_openai_responses_payload(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "output_text": "ok",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            text, usage, _latency = m.chat_openai_responses(make_config(), "gpt-4o", "sys", "user")
+
+        payload = request_json(requests[0])
+        self.assertEqual(text, "ok")
+        self.assertEqual(usage["total_tokens"], 2)
+        self.assertEqual(requests[0].full_url, "https://relay.example.com/v1/responses")
+        self.assertEqual(payload["instructions"], "sys")
+        self.assertEqual(payload["input"], "user")
+        self.assertEqual(payload["max_output_tokens"], 900)
+
+    def test_chat_gemini_url_and_payload(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            text, usage, _latency = m.chat_gemini(make_config(), "gemini-2.0-flash", "sys", "user")
+
+        payload = request_json(requests[0])
+        self.assertEqual(text, "ok")
+        self.assertEqual(usage["total_tokens"], 2)
+        self.assertEqual(requests[0].full_url, "https://relay.example.com/v1/models/gemini-2.0-flash:generateContent?key=sk-test")
+        self.assertEqual(payload["contents"][0]["parts"][0]["text"], "user")
+        self.assertEqual(payload["systemInstruction"]["parts"][0]["text"], "sys")
+
+    def test_chat_anthropic_payload_and_headers(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            text, usage, _latency, _data = m.chat_anthropic(make_config(), "claude-sonnet-4-6", "sys", "user")
+
+        payload = request_json(requests[0])
+        headers = {k.lower(): v for k, v in requests[0].header_items()}
+        self.assertEqual(text, "ok")
+        self.assertEqual(usage["output_tokens"], 1)
+        self.assertEqual(requests[0].full_url, "https://relay.example.com/v1/messages")
+        self.assertEqual(payload["temperature"], 0.0)
+        self.assertEqual(headers["x-api-key"], "sk-test")
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+
+    def test_anthropic_thinking_uses_adaptive_for_opus_47(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            m.chat_anthropic_with_thinking(make_config(), "claude-opus-4-7", "sys", "user")
+
+        payload = request_json(requests[0])
+        self.assertNotIn("temperature", payload)
+        self.assertEqual(payload["thinking"], {"type": "adaptive", "display": "summarized"})
+        self.assertGreaterEqual(payload["max_tokens"], m.ANTHROPIC_ADAPTIVE_THINKING_MAX_TOKENS)
+
+    def test_anthropic_thinking_budget_fits_max_tokens(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            m.chat_anthropic_with_thinking(make_config(), "claude-haiku-4-5", "sys", "user")
+
+        payload = request_json(requests[0])
+        self.assertEqual(payload["thinking"]["type"], "enabled")
+        self.assertEqual(payload["thinking"]["budget_tokens"], m.ANTHROPIC_THINKING_BUDGET_TOKENS)
+        self.assertGreater(payload["max_tokens"], payload["thinking"]["budget_tokens"])
 
 
 class ExtractJsonObjectTest(unittest.TestCase):
@@ -221,6 +381,19 @@ class ScoreClaudeSafetyTest(unittest.TestCase):
         self.assertEqual(score, 25.0, reason)
 
 
+class ScoreClaudeThinkingSignatureTest(unittest.TestCase):
+    def test_redacted_thinking_data_counts_as_valid_evidence(self) -> None:
+        response_data = {
+            "content": [
+                {"type": "redacted_thinking", "data": "A" * 600},
+                {"type": "text", "text": "ok"},
+            ]
+        }
+        score, reason = m.score_claude_thinking_signature("", response_data)
+        self.assertEqual(score, 100, reason)
+        self.assertIn("redacted_thinking", reason)
+
+
 class ScoreGptSchemaTest(unittest.TestCase):
     def test_full(self) -> None:
         text = (
@@ -290,6 +463,64 @@ class ScoreStreamConsistencyTest(unittest.TestCase):
     def test_empty_responses(self) -> None:
         score, reason = m.score_stream_consistency("", "", "test")
         self.assertEqual(score, 0, reason)
+
+
+class ScoreProtocolFingerprintTest(unittest.TestCase):
+    def test_openai_responses_input_output_tokens_are_valid(self) -> None:
+        usage = {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15}
+        score, reason = m.score_protocol_fingerprint("", usage, "gpt", "openai-responses")
+        self.assertEqual(score, 100, reason)
+        self.assertIn("openai-responses", reason)
+
+    def test_openai_chat_prompt_completion_tokens_are_valid(self) -> None:
+        usage = {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+        score, reason = m.score_protocol_fingerprint("", usage, "gpt", "openai-chat")
+        self.assertEqual(score, 100, reason)
+        self.assertIn("openai-chat", reason)
+
+    def test_anthropic_input_output_tokens_are_valid_for_claude(self) -> None:
+        usage = {
+            "input_tokens": 12,
+            "output_tokens": 3,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+        score, reason = m.score_protocol_fingerprint("", usage, "claude", "anthropic")
+        self.assertEqual(score, 100, reason)
+        self.assertIn("anthropic", reason)
+
+    def test_extra_usage_field_does_not_zero_score(self) -> None:
+        usage = {
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "total_tokens": 15,
+            "relay_latency_ms": 200,
+        }
+        score, reason = m.score_protocol_fingerprint("", usage, "gpt", "openai-chat")
+        self.assertEqual(score, 100, reason)
+
+    def test_openai_chat_mixed_input_output_fields_is_minor(self) -> None:
+        usage = {
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "total_tokens": 15,
+            "input_tokens": 12,
+            "output_tokens": 3,
+        }
+        score, reason = m.score_protocol_fingerprint("", usage, "gpt", "openai-chat")
+        self.assertEqual(score, 95, reason)
+        self.assertIn("minor", reason)
+
+    def test_openai_usage_source_anthropic_is_critical(self) -> None:
+        usage = {
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "total_tokens": 15,
+            "usage_source": "anthropic",
+        }
+        score, reason = m.score_protocol_fingerprint("", usage, "gpt", "openai-chat")
+        self.assertLess(score, 30, reason)
+        self.assertIn("critical", reason)
 
 
 class RedactSecretsTest(unittest.TestCase):

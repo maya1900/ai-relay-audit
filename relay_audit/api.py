@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 import urllib.error
 import urllib.request
@@ -9,10 +8,22 @@ from typing import Any, Callable
 
 from .models import ApiConfig
 from .scoring import family_for_model, is_reasoning_model
-from .utils import normalize_base_url
 
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+ANTHROPIC_THINKING_BUDGET_TOKENS = 2048
+ANTHROPIC_THINKING_MAX_TOKENS = 4096
+ANTHROPIC_ADAPTIVE_THINKING_MAX_TOKENS = 8192
+
+
+def build_api_url(config: ApiConfig, path: str) -> str:
+    """Build a request URL, preserving explicit /v1 or /v1beta paths."""
+    if path.startswith(("http://", "https://")):
+        return path
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    has_explicit_version = normalized_path.startswith(("/v1/", "/v1?", "/v1beta/", "/v1beta?"))
+    prefix = "" if has_explicit_version else "/v1"
+    return f"{config.base_url}{prefix}{normalized_path}"
 
 
 def api_request(
@@ -23,7 +34,7 @@ def api_request(
     extra_headers: dict[str, str] | None = None,
     retries: int = 2,
 ) -> dict[str, Any]:
-    url = f"{config.base_url}/v1{path}"
+    url = build_api_url(config, path)
     data = None
     headers = {
         "Authorization": f"Bearer {config.api_key}",
@@ -128,7 +139,7 @@ def chat_openai(config: ApiConfig, model: str, system: str, user: str, stream: b
 
     if stream:
         # Streaming mode: collect chunks
-        url = f"{config.base_url}/v1/chat/completions"
+        url = build_api_url(config, "/chat/completions")
         headers = {
             "Authorization": f"Bearer {config.api_key}",
             "Content-Type": "application/json",
@@ -229,7 +240,7 @@ def chat_anthropic(
     system: str,
     user: str,
     extra_headers: dict[str, str] | None = None,
-    thinking: str | None = None,
+    thinking: str | dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any] | None, int, dict[str, Any] | None]:
     """调用 Anthropic Messages API。
 
@@ -239,12 +250,13 @@ def chat_anthropic(
     payload: dict[str, Any] = {
         "model": model,
         "system": system,
-        "max_tokens": config.max_tokens,
-        "temperature": config.temperature,
+        "max_tokens": _anthropic_max_tokens(config, model, thinking),
         "messages": [{"role": "user", "content": user}],
     }
+    if _anthropic_supports_temperature(model):
+        payload["temperature"] = config.temperature
     if thinking:
-        payload["thinking"] = {"type": thinking, "budget_tokens": 2000}
+        payload["thinking"] = _anthropic_thinking_payload(model, thinking)
     started = time.perf_counter()
     # 同时带 x-api-key（Anthropic 官方）与 Authorization: Bearer（多数中转站），
     # 以最大化兼容性；官方端点会忽略多余的 Authorization 头。
@@ -306,7 +318,7 @@ def chat_gemini(config: ApiConfig, model: str, system: str, user: str) -> tuple[
     try:
         # 尝试在 URL 中传递 key
         data = api_request(config, "POST", f"{endpoint}?key={config.api_key}", payload, extra_headers={"Content-Type": "application/json"})
-    except Exception as e:
+    except Exception:
         # 如果失败，尝试 v1beta
         endpoint = f"/v1beta/models/{model}:generateContent"
         data = api_request(config, "POST", f"{endpoint}?key={config.api_key}", payload, extra_headers={"Content-Type": "application/json"})
@@ -349,10 +361,43 @@ STYLE_CALLERS: dict[str, Callable[[ApiConfig, str, str, str], tuple[str, dict[st
 
 
 def chat_anthropic_with_thinking(
-    config: ApiConfig, model: str, system: str, user: str, thinking: str = "enabled"
+    config: ApiConfig, model: str, system: str, user: str, thinking: str | dict[str, Any] = "enabled"
 ) -> tuple[str, dict[str, Any] | None, int, dict[str, Any] | None]:
     """专门用于需要 thinking 的探针。"""
     return chat_anthropic(config, model, system, user, thinking=thinking)
+
+
+def _normalized_model(model: str) -> str:
+    return model.lower().replace("_", "-").replace(".", "-")
+
+
+def _anthropic_adaptive_thinking_only(model: str) -> bool:
+    return "opus-4-7" in _normalized_model(model)
+
+
+def _anthropic_supports_temperature(model: str) -> bool:
+    return not _anthropic_adaptive_thinking_only(model)
+
+
+def _anthropic_thinking_payload(model: str, thinking: str | dict[str, Any]) -> dict[str, Any]:
+    if _anthropic_adaptive_thinking_only(model):
+        return {"type": "adaptive", "display": "summarized"}
+    if isinstance(thinking, dict):
+        return dict(thinking)
+    if thinking == "adaptive":
+        return {"type": "adaptive", "display": "summarized"}
+    return {"type": thinking, "budget_tokens": ANTHROPIC_THINKING_BUDGET_TOKENS}
+
+
+def _anthropic_max_tokens(config: ApiConfig, model: str, thinking: str | dict[str, Any] | None) -> int:
+    if not thinking:
+        return config.max_tokens
+    payload = _anthropic_thinking_payload(model, thinking)
+    if payload.get("type") == "adaptive":
+        return max(config.max_tokens, ANTHROPIC_ADAPTIVE_THINKING_MAX_TOKENS)
+    budget = payload.get("budget_tokens")
+    budget_tokens = budget if isinstance(budget, int) and not isinstance(budget, bool) else ANTHROPIC_THINKING_BUDGET_TOKENS
+    return max(config.max_tokens, budget_tokens + 1024, ANTHROPIC_THINKING_MAX_TOKENS)
 
 
 def normalize_api_style(style: str) -> str:
