@@ -47,12 +47,48 @@ PROVIDER_KEY_ENV = {
 }
 
 
+def add_common_audit_args(parser: argparse.ArgumentParser, require_models: bool = True) -> None:
+    parser.add_argument("--base-url", default=os.getenv("AI_RELAY_BASE_URL", ""), help="Relay base URL. May include /v1.")
+    parser.add_argument("--api-key", default=os.getenv("AI_RELAY_API_KEY", ""), help="Relay API key.")
+    parser.add_argument("--models", required=require_models, help="Comma-separated model IDs.")
+    parser.add_argument("--model-filter", help="Regex filter applied to model IDs.")
+    parser.add_argument("--limit", type=int, help="Maximum number of models after filtering.")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Request timeout seconds. Default: {DEFAULT_TIMEOUT}.")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help=f"Max output tokens per probe. Default: {DEFAULT_MAX_TOKENS}.")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature. Default: 0.")
+    parser.add_argument("--api-style", default="auto", choices=["auto", "openai-chat", "openai-responses", "anthropic", "gemini"], help="Model call protocol. Default: auto.")
+    parser.add_argument("--mode", default="standard", choices=["quick", "standard", "full"], help="Probe mode. Default: standard.")
+    parser.add_argument("--output-dir", default="reports", help="Report output directory. Default: reports.")
+    parser.add_argument("--baseline", help="Baseline report JSON to compare against.")
+    parser.add_argument("--probes-config", help="External probes JSON config.")
+    parser.add_argument("--long-context", default="off", choices=["off", "32k", "100k", "200k", "max"], help="Optional long-context probe profile. Default: off.")
+    parser.add_argument("--long-context-tokens", type=int, help="Override long-context input token target.")
+    parser.add_argument("--all-targeted", action="store_true", help="Run all targeted probes for each model.")
+    parser.add_argument("--hide-prompts", action="store_true", help="Do not print full prompts.")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="AI Relay Audit terminal UI and baseline utilities."
     )
     parser.add_argument("--tui", action="store_true", help="Start the full-screen terminal UI. This is the default.")
     subparsers = parser.add_subparsers(dest="command")
+
+    audit = subparsers.add_parser("audit", help="Run an audit from the command line and optionally save reports.")
+    add_common_audit_args(audit, require_models=True)
+    audit.add_argument("--no-save-report", dest="save_report", action="store_false", default=True, help="Do not write Markdown/JSON reports.")
+
+    models_cmd = subparsers.add_parser("models", help="Fetch and print models from a relay.")
+    models_cmd.add_argument("--base-url", default=os.getenv("AI_RELAY_BASE_URL", ""), help="Relay base URL. May include /v1.")
+    models_cmd.add_argument("--api-key", default=os.getenv("AI_RELAY_API_KEY", ""), help="Relay API key.")
+    models_cmd.add_argument("--model-filter", help="Regex filter applied to fetched model IDs.")
+    models_cmd.add_argument("--limit", type=int, help="Maximum number of models after filtering.")
+    models_cmd.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Request timeout seconds. Default: {DEFAULT_TIMEOUT}.")
+    models_cmd.add_argument("--json", action="store_true", help="Print models as a JSON array.")
+
+    estimate = subparsers.add_parser("estimate", help="Print request, token, and cost estimates without calling the API.")
+    add_common_audit_args(estimate, require_models=True)
+    estimate.set_defaults(save_report=False)
 
     baseline = subparsers.add_parser("baseline", help="Generate or compare official full-mode baselines.")
     baseline_subparsers = baseline.add_subparsers(dest="baseline_command", required=True)
@@ -193,6 +229,41 @@ def run_baseline_command(args: argparse.Namespace) -> int:
     raise ValueError(f"Unsupported baseline command: {args.baseline_command}")
 
 
+def run_cli_audit(args: argparse.Namespace) -> int:
+    cfg = AuditConfig.from_namespace(args)
+    run_audit(cfg, ConsoleReporter())
+    return 0
+
+
+def run_cli_models(args: argparse.Namespace) -> int:
+    cfg = AuditConfig.from_namespace(args)
+    if not cfg.api.base_url:
+        raise ValueError("Missing Base URL.")
+    if not cfg.api.api_key:
+        raise ValueError("Missing API key.")
+    models = filter_models(fetch_models(cfg.api), cfg.model_filter, cfg.limit)
+    if args.json:
+        print(json.dumps(models, ensure_ascii=False, indent=2))
+    else:
+        for model in models:
+            print(model)
+    return 0
+
+
+def run_cli_estimate(args: argparse.Namespace) -> int:
+    cfg = AuditConfig.from_namespace(args)
+    models = filter_models(cfg.models, cfg.model_filter, cfg.limit)
+    if not models:
+        raise ValueError("No models to estimate.")
+    estimate = build_run_estimate(cfg, models)
+    if cfg.long_context != "off" or cfg.long_context_tokens:
+        token_text = f", target_tokens={cfg.long_context_tokens}" if cfg.long_context_tokens else ""
+        print(f"Long context probe: {cfg.long_context}{token_text}")
+    for line in format_run_estimate(estimate, cfg.output_dir, cfg.save_report):
+        print(line)
+    return 0
+
+
 def run_audit(
     cfg: AuditConfig,
     reporter: Reporter,
@@ -321,6 +392,12 @@ def main() -> int:
     try:
         if getattr(args, "command", None) == "baseline":
             return run_baseline_command(args)
+        if getattr(args, "command", None) == "audit":
+            return run_cli_audit(args)
+        if getattr(args, "command", None) == "models":
+            return run_cli_models(args)
+        if getattr(args, "command", None) == "estimate":
+            return run_cli_estimate(args)
         from .tui import run_tui
 
         return run_tui()

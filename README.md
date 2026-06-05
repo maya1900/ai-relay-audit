@@ -52,6 +52,18 @@ TUI 每次只检测一个模型。`Model` 可以手动输入，也可以按 `F5`
 
 TUI 检测完成后会直接把 Markdown 报告展示在右侧日志里。默认不写文件；需要保存时可以勾选 `Save report file` 自动写入 `Output dir`，也可以在完成后按 `s` 一键保存最近一次报告。
 
+## CLI 模式
+
+无参数运行仍然默认进入 TUI。内部自动化或 CI 可以直接使用 CLI 子命令：
+
+```bash
+python3 ai_relay_audit.py models --base-url https://relay.example.com --api-key "$KEY" --model-filter 'gpt|claude'
+python3 ai_relay_audit.py estimate --models gpt-4o --mode full --long-context 32k
+python3 ai_relay_audit.py audit --base-url https://relay.example.com --api-key "$KEY" --models gpt-4o --mode standard
+```
+
+`audit` 默认保存 Markdown/JSON 报告到 `reports/`，可用 `--no-save-report` 关闭；常用参数与 TUI 字段一致：`--api-style`、`--mode`、`--all-targeted`、`--baseline`、`--long-context`、`--output-dir` 等。`estimate` 不触网，只根据模型、探针和内置价格表输出请求数、输入 token、最大输出 token 和费用上限。
+
 ## 检测模式
 
 `Mode` 字段用来选择检测强度：
@@ -203,6 +215,8 @@ Long context       off/32k/100k/200k/max，默认 off；开启会显著增加输
 - `reports/audit_report_YYYYMMDD_HHMMSS.json`
 
 Markdown 适合人工查看，JSON 适合后续自动分析或归档。
+
+报告中的 `Protocol Evidence` 表会汇总协议级证据，包括 usage keys、response_data 顶层字段、Claude content block types、OpenAI message/tool_calls 字段、Anthropic SSE 事件序列等。协议 detector 低分会进入严重问题列表，优先提示中转站可能存在协议转换、字段剥离或工具/流式接口不完整。
 
 ## 官方 Baseline
 

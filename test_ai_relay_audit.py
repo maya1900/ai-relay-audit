@@ -1052,6 +1052,12 @@ class DecisionSummaryTest(unittest.TestCase):
         json.dumps(rows)
         self.assertEqual(rows[0]["severe_issues"][0]["probe_id"], "universal_reasoning")
 
+    def test_protocol_detector_low_score_is_high_severity(self) -> None:
+        result = make_result("openai_tool_calls", "targeted", 15, "ok", 40)
+        issues = m.detect_severe_issues("gpt-4o", [result])
+        self.assertEqual(issues[0].probe_id, "openai_tool_calls")
+        self.assertEqual(issues[0].severity, "high")
+
 
 class ReportOutputTest(unittest.TestCase):
     def test_build_report_has_decision_summary(self) -> None:
@@ -1076,6 +1082,74 @@ class ReportOutputTest(unittest.TestCase):
             with open(json_path, encoding="utf-8") as file:
                 data = json.load(file)
         self.assertEqual(data["summary"][0]["severe_issues"][0]["probe_id"], "universal_reasoning")
+
+    def test_build_report_includes_protocol_evidence(self) -> None:
+        result = make_result("openai_tool_calls", "targeted", 15, "ok", 100)
+        result.usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        result.response_data = {
+            "id": "chatcmpl-1",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{"id": "call_1", "type": "function"}],
+                    }
+                }
+            ],
+        }
+        report = m.build_report({"gpt-4o": [result]}, make_config())
+        self.assertIn("### Protocol Evidence", report)
+        self.assertIn("tool_calls=function", report)
+
+
+class CliCommandTest(unittest.TestCase):
+    def _audit_args(self, **overrides: object) -> argparse.Namespace:
+        values = {
+            "base_url": "https://relay.example.com",
+            "api_key": "sk-test",
+            "models": "gpt-4o",
+            "model_filter": None,
+            "limit": None,
+            "timeout": 30,
+            "max_tokens": 900,
+            "temperature": 0.0,
+            "api_style": "auto",
+            "mode": "quick",
+            "output_dir": "reports",
+            "save_report": False,
+            "baseline": None,
+            "probes_config": None,
+            "long_context": "off",
+            "long_context_tokens": None,
+            "all_targeted": False,
+            "hide_prompts": True,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_cli_estimate_prints_long_context_cost_context(self) -> None:
+        buf = io.StringIO()
+        args = self._audit_args(long_context="32k")
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(m.run_cli_estimate(args), 0)
+        out = buf.getvalue()
+        self.assertIn("Long context probe: 32k", out)
+        self.assertIn("Estimated input tokens:", out)
+
+    def test_cli_models_filters_and_prints_json(self) -> None:
+        args = argparse.Namespace(
+            base_url="https://relay.example.com",
+            api_key="sk-test",
+            model_filter="gpt",
+            limit=1,
+            timeout=30,
+            json=True,
+        )
+        buf = io.StringIO()
+        with mock.patch("relay_audit.runner.fetch_models", return_value=["claude-sonnet", "gpt-4o"]):
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(m.run_cli_models(args), 0)
+        self.assertEqual(json.loads(buf.getvalue()), ["gpt-4o"])
 
 
 class TuiSaveTest(unittest.TestCase):

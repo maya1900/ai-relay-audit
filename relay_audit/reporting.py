@@ -11,6 +11,18 @@ from .models import ApiConfig, DecisionSummaryRow, ProbeResult, SevereIssue
 from .scoring import family_for_model
 
 
+PROTOCOL_PROBE_IDS = {
+    "protocol_fingerprint",
+    "claude_thinking_signature",
+    "claude_message_protocol",
+    "claude_tool_use",
+    "claude_pdf",
+    "claude_sse_protocol",
+    "openai_tool_calls",
+    "openai_json_schema_protocol",
+}
+
+
 def indent(text: str, prefix: str = "  ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
@@ -101,6 +113,19 @@ def detect_severe_issues(model: str, results: list[ProbeResult]) -> list[SevereI
                     reason=result.reason,
                     icon="🟠"
                 ))
+
+        # 4. 协议级 detector 偏差 - High/Critical
+        elif result.probe.probe_id in PROTOCOL_PROBE_IDS and result.score < 60:
+            severity = "critical" if result.score < 30 else "high"
+            icon = "🔴" if severity == "critical" else "🟠"
+            issues.append(SevereIssue(
+                probe_id=result.probe.probe_id,
+                probe_title=result.probe.title,
+                severity=severity,
+                score=result.score,
+                reason=result.reason,
+                icon=icon,
+            ))
 
         # 4. 身份混乱 - Medium
         elif result.probe.probe_id == "identity_limits" and result.score < 40:
@@ -561,6 +586,14 @@ def format_comparison_markdown(comparison: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _compact_signature_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) or ""
+    return str(value)
+
+
 def build_report(model_results: dict[str, list[ProbeResult]], config: ApiConfig, comparison: dict[str, Any] | None = None) -> str:
     now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     lines = [
@@ -647,6 +680,37 @@ def build_report(model_results: dict[str, list[ProbeResult]], config: ApiConfig,
                 f"- Average latency: {avg_latency if avg_latency is not None else 'N/A'} ms",
             ]
         )
+        evidence_rows = []
+        for result in results:
+            if not result.response_data and result.probe.probe_id not in PROTOCOL_PROBE_IDS:
+                continue
+            signature = _probe_field_signature({"usage": result.usage, "response_data": result.response_data})
+            if signature:
+                evidence_rows.append((result.probe.probe_id, signature))
+        if evidence_rows:
+            lines.extend(
+                [
+                    "",
+                    "### Protocol Evidence",
+                    "",
+                    "| Probe | Usage keys | Response keys | Content/message/tool/SSE evidence |",
+                    "| --- | --- | --- | --- |",
+                ]
+            )
+            for probe_id, signature in evidence_rows:
+                usage_keys = _compact_signature_value(signature.get("usage_keys")).replace("|", "\\|")
+                response_keys = _compact_signature_value(signature.get("response_data_keys")).replace("|", "\\|")
+                evidence = "; ".join(
+                    part
+                    for part in [
+                        "content=" + _compact_signature_value(signature.get("content_types")) if signature.get("content_types") else "",
+                        "message_keys=" + _compact_signature_value(signature.get("message_keys")) if signature.get("message_keys") else "",
+                        "tool_calls=" + _compact_signature_value(signature.get("tool_call_types")) if signature.get("tool_call_types") else "",
+                        "sse=" + _compact_signature_value(signature.get("sse_events")) if signature.get("sse_events") else "",
+                    ]
+                    if part
+                ).replace("|", "\\|")
+                lines.append(f"| {probe_id} | {usage_keys} | {response_keys} | {evidence} |")
         lines.extend(
             [
                 "",
