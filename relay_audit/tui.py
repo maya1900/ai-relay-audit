@@ -242,13 +242,14 @@ class TuiApp:
         self.selected = 0
         self.logs: list[str] = [
             "欢迎使用 AI Relay Audit。",
-            "功能：检测中转站 /v1/models、模型可用性、结构化输出、多约束推理、提示注入抵抗、代码任务与身份一致性。",
-            "针对 GPT/Claude 模型会额外运行家族特定探针；报告会给出能力分、可用性、真实性观察和决策摘要。",
+            "用途：检测 AI 中转站模型是否可用、协议是否匹配、能力和身份是否一致。",
+            "能力：支持 OpenAI/Anthropic/Gemini 协议、GPT/Claude 针对性探针、长上下文和报告导出。",
+            "模式：quick 快速跑通，standard 默认评估，full 全量检测。",
             "第 1 步：填写中转站地址和 API 密钥。",
             "第 2 步：按 F5 拉取并选择模型，也可以手动填写模型。",
             "第 3 步：按 F9 开始检测。",
-            "实时日志默认保持简洁；检测后可按 r 看报告、d 看详情、e 看错误、s 保存、x 清空日志。",
-            "提示：PageUp/PageDown 滚动当前视图；运行中 Esc/c 可取消。按 g 可切换中/英界面。",
+            "完成后按 r 看报告、d 看详情、e 看错误建议、s 保存报告。",
+            "提示：黑盒 API 不能绝对证明底层模型真实身份；运行中 Esc/c 可取消。",
         ]
         self.status = "Idle"
         self.worker: threading.Thread | None = None
@@ -306,7 +307,7 @@ class TuiApp:
             ),
             "mode": (
                 "Detection mode: quick (fast validation), standard (balanced), or full (comprehensive).",
-                "quick = 2 probes, standard = 7 probes (default), full = all targeted probes.",
+                "quick = 2 probes, standard = about 7-8 probes (default), full = all protocol and targeted probes.",
             ),
             "long_context": (
                 "Optional needle-in-haystack long-context probe: off, 32k, 100k, 200k, or max.",
@@ -339,7 +340,7 @@ class TuiApp:
             "max_tokens": ("每个探针允许的最大输出 token。", "默认 900；过低可能截断代码或推理题。"),
             "temperature": ("采样随机性。检测建议保持确定性。", "保持 0 以便复测结果更稳定。"),
             "api_style": ("调用协议：auto、openai-chat、openai-responses、anthropic 或 gemini。", "通常保持 auto；失败时再手动切换协议复测。"),
-            "mode": ("检测模式：quick（快速）、standard（标准）或 full（完整）。", "quick=2探针，standard=7探针（默认），full=含所有针对性探针。"),
+            "mode": ("检测模式：quick（快速）、standard（标准）或 full（完整）。", "quick=2探针，standard=约7-8个探针（默认），full=含全量协议和针对性探针。"),
             "long_context": ("可选长上下文 needle 检索：off、32k、100k、200k 或 max。", "默认关闭；开启前确认弹窗会显示额外 token 和费用预估。"),
             "output_dir": ("保存报告时使用的目录。", "默认 reports；需要保存到别处时再修改。"),
             "save_report": ("检测完成后自动保存 Markdown 和 JSON 报告。", "快速检查可关闭；完成后也可按 s 手动保存。"),

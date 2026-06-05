@@ -1,12 +1,13 @@
 # AI Relay Audit
 
-一个用于检测 AI 中转站模型接口的终端 TUI 工具，重点覆盖 GPT/Claude 模型的：
+一个用于检测 AI 中转站模型接口的终端 TUI + CLI 工具，覆盖 GPT、Claude、Gemini 等常见模型家族，重点回答：
 
-- 模型列表获取：从 OpenAI 兼容 `/v1/models` 自动提取，或手动输入模型 ID。
-- 通用能力检测：结构化输出、多约束推理、提示注入抵抗、代码任务。
-- 针对性检测：按模型名识别 GPT/Claude 家族并运行对应探针。
-- 过程透明：每个步骤打印检测内容、提示词、回复、延迟、token 用量、判分理由。
-- 专业报告：输出 Markdown 和 JSON 报告，包含综合评分和真实性一致性评估。
+- 入口是否可用：从 OpenAI 兼容 `/v1/models` 自动提取模型，或手动输入单个模型 ID。
+- 协议是否匹配：自动尝试 OpenAI Responses/Chat、Anthropic Messages、Gemini API，也可手动指定协议风格。
+- 能力是否稳定：按 `quick` / `standard` / `full` 分层检测结构化输出、多约束推理、提示注入抵抗、代码任务和流式一致性。
+- 身份是否一致：结合模型名、自述、usage 协议指纹、Claude thinking signature、OpenAI tool_calls/json_schema 等证据判断是否存在模型替换或字段剥离迹象。
+- 长上下文是否可靠：可选追加 `32k` / `100k` / `200k` / `max` needle-in-haystack 检索，并在运行前预估请求数、token 和官方费用上限。
+- 报告是否可追溯：输出 Markdown 和 JSON 报告，包含能力分、可用性、真实性观察、严重问题、协议证据和决策摘要；CLI 还支持官方 baseline 生成与对比。
 
 > 注意：黑盒 API 无法绝对证明底层模型真实身份。脚本给出的“真假”结论是基于模型 ID、自述、行为表现和针对性探针的一致性评估。
 
@@ -36,7 +37,7 @@ TUI 操作：
 - `Tab` / `Shift+Tab` / 方向键：切换字段
 - `Enter`：编辑字段或切换复选项（Timeout / Max tokens / Temperature / Limit 等数值字段即时校验，非法值无法保存）
 - `F5`：按当前 Base URL、API Key 拉取模型列表，应用 `Model filter` / `Limit` 后弹窗选择一个模型；弹窗内可直接打字搜索，`Backspace` 删除，`Ctrl+U` 清空
-- `F9`：开始检测当前 `Model`；真正运行前会显示模型数、请求数、最大输出 token 暴露和保存状态，`Enter` 确认，`Esc` 取消
+- `F9`：开始检测当前 `Model`；真正运行前会显示模型数、请求数、最大输出 token 预算和保存状态，`Enter` 确认，`Esc` 取消
 - `l` / `r` / `d` / `e`：切换右侧视图为实时日志 / 完整报告 / 探针详情 / 错误建议
 - `s`：检测完成后，如果报告尚未保存，一键保存最近一次 Markdown / JSON 报告
 - `x`：清空实时日志（不删除已生成的报告、探针详情和错误记录）
@@ -113,6 +114,7 @@ Timeout            请求超时秒数，默认 90
 Max tokens         每次检测最大输出 token，默认 900
 Temperature        默认 0
 API style          auto/openai-responses/openai-chat/anthropic/gemini，默认 auto
+Mode               quick/standard/full，默认 standard
 Long context       off/32k/100k/200k/max，默认 off；开启会显著增加输入 token 成本
 ```
 
