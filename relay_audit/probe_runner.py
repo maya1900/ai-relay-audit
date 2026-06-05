@@ -2,10 +2,50 @@ from __future__ import annotations
 
 from typing import Any
 
-from .api import chat, chat_anthropic_with_thinking, chat_openai, normalize_api_style
+from .api import (
+    chat,
+    chat_anthropic_full,
+    chat_anthropic_pdf,
+    chat_anthropic_tool_use,
+    chat_anthropic_with_thinking,
+    chat_openai,
+    chat_openai_json_schema,
+    chat_openai_tool_call,
+    normalize_api_style,
+    stream_anthropic_events,
+)
 from .models import ApiConfig, Probe, ProbeResult
 from .reporters import Reporter
 from .scoring import family_for_model
+
+
+CLAUDE_PROTOCOL_PROBES = {
+    "claude_message_protocol",
+    "claude_tool_use",
+    "claude_pdf",
+    "claude_sse_protocol",
+}
+
+OPENAI_PROTOCOL_PROBES = {
+    "openai_tool_calls",
+    "openai_json_schema_protocol",
+}
+
+RESPONSE_DATA_SCORERS = CLAUDE_PROTOCOL_PROBES | OPENAI_PROTOCOL_PROBES
+
+
+def _skipped_result(probe: Probe, family: str, expected: str) -> ProbeResult:
+    return ProbeResult(
+        probe,
+        "skipped",
+        0,
+        f"该探针仅适用于 {expected} 模型，当前模型家族为 {family}",
+        "",
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 def run_probe(
@@ -20,6 +60,8 @@ def run_probe(
     reporter.probe_start(probe, index, total, show_prompts)
     try:
         response_data: dict[str, Any] | None = None
+        stream_response: str | None = None
+        non_stream_response: str | None = None
         family = family_for_model(model)
         actual_api_style = normalize_api_style(config.api_style)
 
@@ -27,11 +69,7 @@ def run_probe(
         if probe.probe_id == "claude_thinking_signature":
             if family != "claude":
                 # 非 Claude 模型跳过此探针
-                result = ProbeResult(
-                    probe, "skipped", 0,
-                    f"该探针仅适用于 Claude 模型，当前模型家族为 {family}",
-                    "", None, None, None, None
-                )
+                result = _skipped_result(probe, family, "Claude")
                 reporter.probe_result(result, show_prompts)
                 return result
 
@@ -39,6 +77,39 @@ def run_probe(
             response, usage, latency_ms, response_data = chat_anthropic_with_thinking(
                 config, model, probe.system, probe.user, thinking="enabled"
             )
+            actual_api_style = "anthropic"
+        elif probe.probe_id in CLAUDE_PROTOCOL_PROBES:
+            if family != "claude":
+                result = _skipped_result(probe, family, "Claude")
+                reporter.probe_result(result, show_prompts)
+                return result
+            actual_api_style = "anthropic"
+            if probe.probe_id == "claude_message_protocol":
+                response, usage, latency_ms, response_data = chat_anthropic_full(
+                    config,
+                    model,
+                    probe.system,
+                    [{"role": "user", "content": probe.user}],
+                    {"max_tokens": min(config.max_tokens, 128)},
+                )
+            elif probe.probe_id == "claude_tool_use":
+                response, usage, latency_ms, response_data = chat_anthropic_tool_use(config, model)
+            elif probe.probe_id == "claude_pdf":
+                response, usage, latency_ms, response_data = chat_anthropic_pdf(config, model)
+            else:
+                response, usage, latency_ms, response_data = stream_anthropic_events(
+                    config, model, probe.system, probe.user
+                )
+        elif probe.probe_id in OPENAI_PROTOCOL_PROBES:
+            if family != "gpt":
+                result = _skipped_result(probe, family, "OpenAI/GPT")
+                reporter.probe_result(result, show_prompts)
+                return result
+            actual_api_style = "openai-chat"
+            if probe.probe_id == "openai_tool_calls":
+                response, usage, latency_ms, response_data = chat_openai_tool_call(config, model)
+            else:
+                response, usage, latency_ms, response_data = chat_openai_json_schema(config, model)
         elif probe.probe_id == "stream_consistency":
             # 特殊处理 stream 一致性探针：需要分别调用 stream 和 non-stream
             # 只对 OpenAI 兼容接口测试（Anthropic 和 Gemini 的 streaming 格式不同）
@@ -72,6 +143,11 @@ def run_probe(
         # 调用评分器
         if probe.probe_id == "claude_thinking_signature":
             score, reason = probe.scorer(response, response_data)
+        elif probe.probe_id in RESPONSE_DATA_SCORERS:
+            if probe.probe_id == "openai_json_schema_protocol":
+                score, reason = probe.scorer(response, response_data, usage)
+            else:
+                score, reason = probe.scorer(response, response_data)
         elif probe.probe_id == "protocol_fingerprint":
             score, reason = probe.scorer(response, usage, family, actual_api_style)
         elif probe.probe_id == "stream_consistency":

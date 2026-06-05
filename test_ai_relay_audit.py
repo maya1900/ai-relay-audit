@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import io
 import json
@@ -59,11 +60,15 @@ def make_config(api_key: str = "sk-test") -> m.ApiConfig:
 
 
 class FakeHTTPResponse:
-    def __init__(self, body: dict[str, object]) -> None:
+    def __init__(self, body: dict[str, object], lines: list[bytes] | None = None) -> None:
         self.body = body
+        self.lines = lines or []
 
     def read(self) -> bytes:
         return json.dumps(self.body).encode("utf-8")
+
+    def __iter__(self):
+        return iter(self.lines)
 
     def __enter__(self) -> "FakeHTTPResponse":
         return self
@@ -258,6 +263,154 @@ class ApiRequestTest(unittest.TestCase):
         self.assertEqual(payload["thinking"]["budget_tokens"], m.ANTHROPIC_THINKING_BUDGET_TOKENS)
         self.assertGreater(payload["max_tokens"], payload["thinking"]["budget_tokens"])
 
+    def test_chat_openai_tool_call_payload(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"location":"Boston, MA","unit":"celsius"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            _text, usage, _latency, data = m.chat_openai_tool_call(make_config(), "gpt-4o")
+
+        payload = request_json(requests[0])
+        self.assertEqual(usage["total_tokens"], 2)
+        self.assertEqual(data["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(requests[0].full_url, "https://relay.example.com/v1/chat/completions")
+        self.assertEqual(payload["tools"][0]["function"]["name"], "get_weather")
+        self.assertEqual(payload["tool_choice"]["function"]["name"], "get_weather")
+
+    def test_chat_openai_json_schema_payload(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "id": "chatcmpl-2",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [{"message": {"role": "assistant", "content": '{"ok":true,"nonce":"openai-protocol"}'}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            text, usage, _latency, _data = m.chat_openai_json_schema(make_config(), "gpt-4o")
+
+        payload = request_json(requests[0])
+        self.assertEqual(text, '{"ok":true,"nonce":"openai-protocol"}')
+        self.assertEqual(usage["total_tokens"], 5)
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+
+    def test_chat_anthropic_tool_use_payload(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Tokyo", "unit": "celsius"}}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            _text, usage, _latency, data = m.chat_anthropic_tool_use(make_config(), "claude-sonnet-4-6")
+
+        payload = request_json(requests[0])
+        headers = {k.lower(): v for k, v in requests[0].header_items()}
+        self.assertEqual(usage["output_tokens"], 1)
+        self.assertEqual(data["stop_reason"], "tool_use")
+        self.assertEqual(payload["tools"][0]["name"], "get_weather")
+        self.assertEqual(payload["tool_choice"], {"type": "tool", "name": "get_weather"})
+        self.assertEqual(headers["x-api-key"], "sk-test")
+
+    def test_chat_anthropic_pdf_payload_contains_pdf_document(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({
+                "id": "msg_2",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": m.PDF_MAGIC_STRING}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            text, _usage, _latency, _data = m.chat_anthropic_pdf(make_config(), "claude-sonnet-4-6")
+
+        payload = request_json(requests[0])
+        document = payload["messages"][0]["content"][0]
+        pdf_bytes = base64.b64decode(document["source"]["data"])
+        self.assertEqual(text, m.PDF_MAGIC_STRING)
+        self.assertEqual(document["type"], "document")
+        self.assertEqual(document["source"]["media_type"], "application/pdf")
+        self.assertTrue(pdf_bytes.startswith(b"%PDF-1.4"))
+        self.assertIn(m.PDF_MAGIC_STRING.encode("ascii"), pdf_bytes)
+
+    def test_stream_anthropic_events_collects_sse_sequence(self) -> None:
+        requests = []
+        lines = [
+            b"event: message_start\n",
+            b'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}\n',
+            b"\n",
+            b"event: content_block_start\n",
+            b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n',
+            b"event: content_block_delta\n",
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"sse-ok"}}\n',
+            b"event: content_block_stop\n",
+            b'data: {"type":"content_block_stop","index":0}\n',
+            b"event: message_delta\n",
+            b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}\n',
+            b"event: message_stop\n",
+            b'data: {"type":"message_stop"}\n',
+        ]
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({}, lines=lines)
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            text, usage, _latency, data = m.stream_anthropic_events(make_config(), "claude-sonnet-4-6", "sys", "user")
+
+        payload = request_json(requests[0])
+        self.assertEqual(text, "sse-ok")
+        self.assertEqual(usage["output_tokens"], 2)
+        self.assertTrue(payload["stream"])
+        self.assertEqual(data["events"][0]["event"], "message_start")
+
 
 class ExtractJsonObjectTest(unittest.TestCase):
     def test_plain(self) -> None:
@@ -392,6 +545,97 @@ class ScoreClaudeThinkingSignatureTest(unittest.TestCase):
         score, reason = m.score_claude_thinking_signature("", response_data)
         self.assertEqual(score, 100, reason)
         self.assertIn("redacted_thinking", reason)
+
+
+class ScoreClaudeProtocolDetectorTest(unittest.TestCase):
+    def _message(self) -> dict[str, object]:
+        return {
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "protocol-ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        }
+
+    def test_message_protocol_valid(self) -> None:
+        score, reason = m.score_claude_message_protocol("", self._message())
+        self.assertEqual(score, 100, reason)
+        self.assertIn("message id=通过", reason)
+
+    def test_pdf_detects_document_content_and_shape(self) -> None:
+        data = self._message()
+        data["content"] = [{"type": "text", "text": m.PDF_MAGIC_STRING}]
+        score, reason = m.score_claude_pdf(m.PDF_MAGIC_STRING, data)
+        self.assertEqual(score, 100, reason)
+
+    def test_tool_use_valid(self) -> None:
+        data = self._message()
+        data["content"] = [
+            {"type": "tool_use", "id": "toolu_123", "name": "get_weather", "input": {"city": "Tokyo", "unit": "celsius"}}
+        ]
+        data["stop_reason"] = "tool_use"
+        score, reason = m.score_claude_tool_use("", data)
+        self.assertEqual(score, 100, reason)
+        self.assertIn("tool_use id=通过", reason)
+
+    def test_sse_sequence_valid(self) -> None:
+        response_data = {
+            "events": [
+                {
+                    "event": "message_start",
+                    "data": {
+                        "type": "message_start",
+                        "message": {"id": "msg_1", "type": "message", "role": "assistant"},
+                    },
+                },
+                {"event": "content_block_start", "data": {"type": "content_block_start"}},
+                {"event": "content_block_delta", "data": {"type": "content_block_delta", "delta": {"text": "sse-ok"}}},
+                {"event": "content_block_stop", "data": {"type": "content_block_stop"}},
+                {"event": "message_delta", "data": {"type": "message_delta"}},
+                {"event": "message_stop", "data": {"type": "message_stop"}},
+            ]
+        }
+        score, reason = m.score_claude_sse_protocol("", response_data)
+        self.assertEqual(score, 100, reason)
+
+
+class ScoreOpenAIProtocolDetectorTest(unittest.TestCase):
+    def _chat_completion(self, message: dict[str, object], finish_reason: str = "stop") -> dict[str, object]:
+        return {
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{"message": message, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+        }
+
+    def test_tool_calls_valid(self) -> None:
+        data = self._chat_completion(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location":"Boston, MA","unit":"celsius"}',
+                        },
+                    }
+                ],
+            },
+            "tool_calls",
+        )
+        score, reason = m.score_openai_tool_calls("", data)
+        self.assertEqual(score, 100, reason)
+        self.assertIn("call id/type=通过", reason)
+
+    def test_json_schema_valid(self) -> None:
+        data = self._chat_completion({"role": "assistant", "content": '{"ok":true,"nonce":"openai-protocol"}'})
+        score, reason = m.score_openai_json_schema('{"ok":true,"nonce":"openai-protocol"}', data)
+        self.assertEqual(score, 100, reason)
 
 
 class ScoreGptSchemaTest(unittest.TestCase):

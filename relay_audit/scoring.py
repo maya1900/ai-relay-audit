@@ -5,6 +5,9 @@ import re
 from typing import Any
 
 
+PDF_MAGIC_STRING = "AI-RELAY-AUDIT-PDF-MAGIC-7F3K"
+
+
 def family_for_model(model: str) -> str:
     lowered = model.lower()
     if any(x in lowered for x in ("claude", "anthropic", "sonnet", "opus", "haiku")):
@@ -248,6 +251,266 @@ def score_claude_thinking_signature(text: str, response_data: dict[str, Any] | N
         return score, f"检测到可疑 {label}（{details}）- 格式异常，需人工复核"
     else:
         return score, f"{label} 无效（{details}）"
+
+
+def _weighted_protocol_score(checks: list[tuple[str, bool, float]]) -> tuple[float, str]:
+    score = sum(weight for _, ok, weight in checks if ok)
+    details = "；".join(f"{name}={'通过' if ok else '未通过'}" for name, ok, _ in checks)
+    return min(100.0, score), details
+
+
+def _content_blocks(response_data: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(response_data, dict):
+        return []
+    content = response_data.get("content")
+    if not isinstance(content, list):
+        return []
+    return [item for item in content if isinstance(item, dict)]
+
+
+def _anthropic_content_text(response_data: dict[str, Any] | None) -> str:
+    chunks: list[str] = []
+    for block in _content_blocks(response_data):
+        if isinstance(block.get("text"), str):
+            chunks.append(block["text"])
+    return "".join(chunks)
+
+
+def _anthropic_message_protocol_checks(response_data: dict[str, Any] | None) -> list[tuple[str, bool, float]]:
+    if not isinstance(response_data, dict):
+        return [
+            ("完整响应体", False, 20),
+            ("message id", False, 20),
+            ("type/role", False, 15),
+            ("response.model", False, 15),
+            ("usage", False, 20),
+            ("content blocks", False, 10),
+        ]
+    usage = response_data.get("usage")
+    content = response_data.get("content")
+    valid_content_types = {
+        "text",
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "server_tool_use",
+        "web_search_tool_result",
+        "code_execution_tool_result",
+    }
+    return [
+        ("完整响应体", True, 20),
+        ("message id", isinstance(response_data.get("id"), str) and response_data["id"].startswith("msg_"), 20),
+        ("type/role", response_data.get("type") == "message" and response_data.get("role") == "assistant", 15),
+        ("response.model", isinstance(response_data.get("model"), str) and bool(response_data["model"].strip()), 15),
+        (
+            "usage",
+            isinstance(usage, dict)
+            and _nonneg_int(usage.get("input_tokens"))
+            and _nonneg_int(usage.get("output_tokens")),
+            20,
+        ),
+        (
+            "content blocks",
+            isinstance(content, list)
+            and bool(content)
+            and all(isinstance(block, dict) and block.get("type") in valid_content_types for block in content),
+            10,
+        ),
+    ]
+
+
+def score_claude_message_protocol(text: str, response_data: dict[str, Any] | None = None) -> tuple[float, str]:
+    del text
+    score, details = _weighted_protocol_score(_anthropic_message_protocol_checks(response_data))
+    prefix = "Claude Messages 响应协议正常" if score >= 90 else "Claude Messages 响应协议存在偏差"
+    return score, f"{prefix}：{details}"
+
+
+def score_claude_pdf(text: str, response_data: dict[str, Any] | None = None) -> tuple[float, str]:
+    content_text = _anthropic_content_text(response_data)
+    protocol_score, _ = _weighted_protocol_score(_anthropic_message_protocol_checks(response_data))
+    has_magic = PDF_MAGIC_STRING in text or PDF_MAGIC_STRING in content_text
+    has_text_block = any(block.get("type") == "text" and isinstance(block.get("text"), str) for block in _content_blocks(response_data))
+    checks = [
+        ("PDF 文档内容被正确读取", has_magic, 70),
+        ("Claude message 协议形态", protocol_score >= 80, 20),
+        ("text content block", has_text_block, 10),
+    ]
+    score, details = _weighted_protocol_score(checks)
+    prefix = "Claude PDF 协议能力正常" if score >= 90 else "Claude PDF 协议能力存在偏差"
+    return score, f"{prefix}：{details}"
+
+
+def score_claude_tool_use(text: str, response_data: dict[str, Any] | None = None) -> tuple[float, str]:
+    del text
+    tool_blocks = [block for block in _content_blocks(response_data) if block.get("type") == "tool_use"]
+    tool = tool_blocks[0] if tool_blocks else {}
+    tool_input = tool.get("input") if isinstance(tool, dict) else None
+    input_text = json.dumps(tool_input, ensure_ascii=False).lower() if isinstance(tool_input, dict) else ""
+    checks = [
+        ("tool_use block", bool(tool_blocks), 25),
+        ("tool_use id", isinstance(tool.get("id"), str) and tool["id"].startswith("toolu_"), 20),
+        ("tool name", tool.get("name") == "get_weather", 20),
+        (
+            "tool input",
+            isinstance(tool_input, dict) and "tokyo" in input_text and "celsius" in input_text,
+            20,
+        ),
+        (
+            "stop_reason",
+            isinstance(response_data, dict) and response_data.get("stop_reason") == "tool_use",
+            15,
+        ),
+    ]
+    score, details = _weighted_protocol_score(checks)
+    prefix = "Claude tool_use 协议正常" if score >= 90 else "Claude tool_use 协议存在偏差"
+    return score, f"{prefix}：{details}"
+
+
+def _anthropic_event_name(entry: dict[str, Any]) -> str:
+    event = entry.get("event")
+    if isinstance(event, str) and event:
+        return event
+    data = entry.get("data")
+    if isinstance(data, dict) and isinstance(data.get("type"), str):
+        return data["type"]
+    return ""
+
+
+def score_claude_sse_protocol(text: str, response_data: dict[str, Any] | None = None) -> tuple[float, str]:
+    del text
+    raw_events = response_data.get("events") if isinstance(response_data, dict) else None
+    if not isinstance(raw_events, list):
+        return 0, "未获取到 Anthropic SSE events"
+    entries = [event for event in raw_events if isinstance(event, dict)]
+    names = [_anthropic_event_name(event) for event in entries]
+    names = [name for name in names if name and name != "ping"]
+
+    def first_index(name: str) -> int | None:
+        try:
+            return names.index(name)
+        except ValueError:
+            return None
+
+    start = first_index("message_start")
+    block_start = first_index("content_block_start")
+    block_delta = first_index("content_block_delta")
+    block_stop = first_index("content_block_stop")
+    message_delta = first_index("message_delta")
+    message_stop = first_index("message_stop")
+    ordered = None not in (start, block_start, block_delta, block_stop, message_delta, message_stop) and (
+        start < block_start < block_delta < block_stop < message_delta < message_stop  # type: ignore[operator]
+    )
+    start_data = entries[start].get("data") if start is not None and start < len(entries) else None
+    start_message = start_data.get("message") if isinstance(start_data, dict) else None
+    has_start_shape = (
+        isinstance(start_message, dict)
+        and isinstance(start_message.get("id"), str)
+        and start_message["id"].startswith("msg_")
+        and start_message.get("type") == "message"
+        and start_message.get("role") == "assistant"
+    )
+    has_text_delta = any(
+        isinstance(event.get("data"), dict)
+        and isinstance(event["data"].get("delta"), dict)
+        and isinstance(event["data"]["delta"].get("text"), str)
+        for event in entries
+    )
+    checks = [
+        ("message_start shape", has_start_shape, 20),
+        ("事件完整", all(index is not None for index in (start, block_start, block_delta, block_stop, message_delta, message_stop)), 30),
+        ("事件顺序", bool(ordered), 30),
+        ("text delta", has_text_delta, 10),
+        ("message_stop 结尾", bool(names) and names[-1] == "message_stop", 10),
+    ]
+    score, details = _weighted_protocol_score(checks)
+    prefix = "Claude SSE 序列正常" if score >= 90 else "Claude SSE 序列存在偏差"
+    return score, f"{prefix}：{details}"
+
+
+def _openai_chat_message(response_data: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(response_data, dict):
+        return {}
+    choices = response_data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return {}
+    message = choices[0].get("message")
+    return message if isinstance(message, dict) else {}
+
+
+def _openai_chat_response_shape(response_data: dict[str, Any] | None) -> bool:
+    if not isinstance(response_data, dict):
+        return False
+    choices = response_data.get("choices")
+    usage = response_data.get("usage")
+    return (
+        isinstance(response_data.get("id"), str)
+        and response_data["id"].startswith(("chatcmpl-", "chatcmpl_"))
+        and response_data.get("object") == "chat.completion"
+        and isinstance(response_data.get("model"), str)
+        and isinstance(choices, list)
+        and bool(choices)
+        and isinstance(usage, dict)
+        and _nonneg_int(usage.get("prompt_tokens"))
+        and _nonneg_int(usage.get("completion_tokens"))
+    )
+
+
+def score_openai_tool_calls(text: str, response_data: dict[str, Any] | None = None) -> tuple[float, str]:
+    del text
+    message = _openai_chat_message(response_data)
+    tool_calls = message.get("tool_calls")
+    call = tool_calls[0] if isinstance(tool_calls, list) and tool_calls and isinstance(tool_calls[0], dict) else {}
+    function = call.get("function") if isinstance(call, dict) else {}
+    if not isinstance(function, dict):
+        function = {}
+    args_text = function.get("arguments")
+    try:
+        args = json.loads(args_text) if isinstance(args_text, str) else {}
+    except json.JSONDecodeError:
+        args = {}
+    args_blob = json.dumps(args, ensure_ascii=False).lower() if isinstance(args, dict) else ""
+    finish_reason = None
+    if isinstance(response_data, dict) and isinstance(response_data.get("choices"), list) and response_data["choices"]:
+        first_choice = response_data["choices"][0]
+        if isinstance(first_choice, dict):
+            finish_reason = first_choice.get("finish_reason")
+    checks = [
+        ("chat.completion shape", _openai_chat_response_shape(response_data), 20),
+        ("assistant tool_calls", message.get("role") == "assistant" and bool(tool_calls), 20),
+        ("call id/type", isinstance(call.get("id"), str) and call["id"].startswith("call_") and call.get("type") == "function", 20),
+        ("function name", function.get("name") == "get_weather", 15),
+        ("arguments JSON", isinstance(args, dict) and "boston" in args_blob and "celsius" in args_blob, 15),
+        ("finish_reason", finish_reason == "tool_calls", 10),
+    ]
+    score, details = _weighted_protocol_score(checks)
+    prefix = "OpenAI tool_calls 协议正常" if score >= 90 else "OpenAI tool_calls 协议存在偏差"
+    return score, f"{prefix}：{details}"
+
+
+def score_openai_json_schema(
+    text: str,
+    response_data: dict[str, Any] | None = None,
+    usage: dict[str, Any] | None = None,
+) -> tuple[float, str]:
+    obj = extract_json_object(text)
+    schema_ok = obj is not None and obj.get("ok") is True and obj.get("nonce") == "openai-protocol" and set(obj) == {"ok", "nonce"}
+    message = _openai_chat_message(response_data)
+    usage_data = usage if isinstance(usage, dict) else response_data.get("usage") if isinstance(response_data, dict) else None
+    usage_ok = (
+        isinstance(usage_data, dict)
+        and _nonneg_int(usage_data.get("prompt_tokens"))
+        and _nonneg_int(usage_data.get("completion_tokens"))
+    )
+    checks = [
+        ("json_schema 输出", bool(schema_ok), 60),
+        ("chat.completion shape", _openai_chat_response_shape(response_data), 20),
+        ("assistant content", message.get("role") == "assistant" and isinstance(message.get("content"), str), 10),
+        ("usage", usage_ok, 10),
+    ]
+    score, details = _weighted_protocol_score(checks)
+    prefix = "OpenAI json_schema 协议正常" if score >= 90 else "OpenAI json_schema 协议存在偏差"
+    return score, f"{prefix}：{details}"
 
 
 def _usage_protocol(api_style: str, usage: dict[str, Any], expected_family: str) -> str:

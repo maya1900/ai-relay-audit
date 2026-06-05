@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import time
 import urllib.error
@@ -7,7 +8,7 @@ import urllib.request
 from typing import Any, Callable
 
 from .models import ApiConfig
-from .scoring import family_for_model, is_reasoning_model
+from .scoring import PDF_MAGIC_STRING, family_for_model, is_reasoning_model
 
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -234,6 +235,89 @@ def chat_openai_responses(
     return text, data.get("usage"), latency_ms
 
 
+def chat_openai_full(
+    config: ApiConfig,
+    model: str,
+    messages: list[dict[str, Any]],
+    extra_payload: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any] | None, int, dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    if is_reasoning_model(model):
+        payload["max_completion_tokens"] = reasoning_token_budget(config)
+    else:
+        payload["temperature"] = config.temperature
+        payload["max_tokens"] = config.max_tokens
+    if extra_payload:
+        payload.update(extra_payload)
+    started = time.perf_counter()
+    data = api_request(config, "POST", "/chat/completions", payload)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    text = _openai_chat_text(data)
+    return text, data.get("usage"), latency_ms, data
+
+
+def chat_openai_tool_call(config: ApiConfig, model: str) -> tuple[str, dict[str, Any] | None, int, dict[str, Any]]:
+    token_key = "max_completion_tokens" if is_reasoning_model(model) else "max_tokens"
+    return chat_openai_full(
+        config,
+        model,
+        [{"role": "user", "content": "Use get_weather for Boston, MA in celsius. Do not answer directly."}],
+        {
+            token_key: min(reasoning_token_budget(config) if is_reasoning_model(model) else config.max_tokens, 128),
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get current weather for a city.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                            },
+                            "required": ["location", "unit"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+        },
+    )
+
+
+def chat_openai_json_schema(config: ApiConfig, model: str) -> tuple[str, dict[str, Any] | None, int, dict[str, Any]]:
+    token_key = "max_completion_tokens" if is_reasoning_model(model) else "max_tokens"
+    return chat_openai_full(
+        config,
+        model,
+        [{"role": "user", "content": 'Return JSON with ok=true and nonce="openai-protocol".'}],
+        {
+            token_key: min(reasoning_token_budget(config) if is_reasoning_model(model) else config.max_tokens, 128),
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "relay_audit_probe",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "ok": {"type": "boolean"},
+                            "nonce": {"type": "string"},
+                        },
+                        "required": ["ok", "nonce"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        },
+    )
+
+
 def chat_anthropic(
     config: ApiConfig,
     model: str,
@@ -258,12 +342,8 @@ def chat_anthropic(
     if thinking:
         payload["thinking"] = _anthropic_thinking_payload(model, thinking)
     started = time.perf_counter()
-    # 同时带 x-api-key（Anthropic 官方）与 Authorization: Bearer（多数中转站），
-    # 以最大化兼容性；官方端点会忽略多余的 Authorization 头。
-    headers = {
-        "x-api-key": config.api_key,
-        "anthropic-version": "2023-06-01",
-    }
+    # 同时保留 api_request 默认的 Bearer Authorization 与 Anthropic 官方 x-api-key。
+    headers = _anthropic_headers(config)
     if extra_headers:
         headers.update(extra_headers)
     data = api_request(config, "POST", "/messages", payload, extra_headers=headers)
@@ -275,6 +355,139 @@ def chat_anthropic(
         text = str(content or "")
     usage = data.get("usage")
     return text, usage, latency_ms, data
+
+
+def chat_anthropic_full(
+    config: ApiConfig,
+    model: str,
+    system: str,
+    messages: list[dict[str, Any]],
+    extra_payload: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any] | None, int, dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "system": system,
+        "max_tokens": config.max_tokens,
+        "messages": messages,
+    }
+    if _anthropic_supports_temperature(model):
+        payload["temperature"] = config.temperature
+    if extra_payload:
+        payload.update(extra_payload)
+    started = time.perf_counter()
+    data = api_request(config, "POST", "/messages", payload, extra_headers=_anthropic_headers(config))
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    content = data.get("content")
+    if isinstance(content, list):
+        text = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    else:
+        text = str(content or "")
+    return text, data.get("usage"), latency_ms, data
+
+
+def chat_anthropic_tool_use(config: ApiConfig, model: str) -> tuple[str, dict[str, Any] | None, int, dict[str, Any]]:
+    return chat_anthropic_full(
+        config,
+        model,
+        "Use tools when requested.",
+        [{"role": "user", "content": "Use get_weather for Tokyo in celsius. Do not answer directly."}],
+        {
+            "max_tokens": min(config.max_tokens, 256),
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather for a city.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                        },
+                        "required": ["city", "unit"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+        },
+    )
+
+
+def chat_anthropic_pdf(config: ApiConfig, model: str) -> tuple[str, dict[str, Any] | None, int, dict[str, Any]]:
+    pdf_data = base64.b64encode(build_test_pdf(PDF_MAGIC_STRING)).decode("ascii")
+    return chat_anthropic_full(
+        config,
+        model,
+        "Read the document and answer exactly.",
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_data,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "What exact unique identifier appears in the document? Reply with only the identifier.",
+                    },
+                ],
+            }
+        ],
+        {"max_tokens": min(config.max_tokens, 128)},
+    )
+
+
+def stream_anthropic_events(config: ApiConfig, model: str, system: str, user: str) -> tuple[str, dict[str, Any] | None, int, dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "system": system,
+        "max_tokens": min(config.max_tokens, 128),
+        "messages": [{"role": "user", "content": user}],
+        "stream": True,
+    }
+    if _anthropic_supports_temperature(model):
+        payload["temperature"] = config.temperature
+    url = build_api_url(config, "/messages")
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=_anthropic_headers(config), method="POST")
+    started = time.perf_counter()
+    event_name: str | None = None
+    events: list[dict[str, Any]] = []
+    text_chunks: list[str] = []
+    usage: dict[str, Any] | None = None
+    with urllib.request.urlopen(request, timeout=config.timeout) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if line.startswith("event:"):
+                event_name = line.split(":", 1)[1].strip()
+                continue
+            if not line.startswith("data:"):
+                continue
+            payload_text = line.split(":", 1)[1].strip()
+            try:
+                item = json.loads(payload_text)
+            except json.JSONDecodeError:
+                item = {"raw": payload_text}
+            if isinstance(item, dict):
+                events.append({"event": event_name, "data": item})
+                delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+                if isinstance(delta.get("text"), str):
+                    text_chunks.append(delta["text"])
+                if isinstance(item.get("usage"), dict):
+                    usage = item["usage"]
+                message = item.get("message")
+                if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                    usage = message["usage"]
+                if isinstance(delta.get("usage"), dict):
+                    usage = delta["usage"]
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    return "".join(text_chunks), usage, latency_ms, {"events": events}
 
 
 def chat_gemini(config: ApiConfig, model: str, system: str, user: str) -> tuple[str, dict[str, Any] | None, int]:
@@ -349,6 +562,56 @@ def chat_gemini(config: ApiConfig, model: str, system: str, user: str) -> tuple[
         }
 
     return text, usage, latency_ms
+
+
+def _openai_chat_text(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+    content = message.get("content") if isinstance(message, dict) else ""
+    if isinstance(content, list):
+        return "".join(str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content)
+    return str(content or "")
+
+
+def _anthropic_headers(config: ApiConfig) -> dict[str, str]:
+    return {
+        "x-api-key": config.api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+
+
+def build_test_pdf(text: str) -> bytes:
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        f"<< /Length {len(stream.encode('ascii'))} >>\nstream\n{stream}\nendstream".encode("ascii"),
+    ]
+    chunks = [b"%PDF-1.4\n"]
+    offsets = [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(sum(len(chunk) for chunk in chunks))
+        chunks.append(f"{index} 0 obj\n".encode("ascii"))
+        chunks.append(obj)
+        chunks.append(b"\nendobj\n")
+    xref_offset = sum(len(chunk) for chunk in chunks)
+    xref = [b"xref\n", f"0 {len(objects) + 1}\n".encode("ascii"), b"0000000000 65535 f \n"]
+    for offset in offsets[1:]:
+        xref.append(f"{offset:010d} 00000 n \n".encode("ascii"))
+    chunks.extend(xref)
+    chunks.append(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return b"".join(chunks)
 
 
 # 需要特殊处理的探针（如需要 thinking signature）会直接调用 chat_anthropic_with_thinking
