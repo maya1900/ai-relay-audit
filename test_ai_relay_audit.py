@@ -638,6 +638,17 @@ class ScoreOpenAIProtocolDetectorTest(unittest.TestCase):
         self.assertEqual(score, 100, reason)
 
 
+class ScoreLongContextTest(unittest.TestCase):
+    def test_scores_json_needle_response(self) -> None:
+        text = json.dumps({"marker": m.LONG_CONTEXT_NEEDLE, "position": "middle", "checksum": m.LONG_CONTEXT_CHECKSUM})
+        score, reason = m.score_long_context_retrieval(text)
+        self.assertEqual(score, 100, reason)
+
+    def test_partial_plain_text_gets_needle_credit_only(self) -> None:
+        score, reason = m.score_long_context_retrieval(f"found {m.LONG_CONTEXT_NEEDLE}")
+        self.assertEqual(score, 55, reason)
+
+
 class ScoreGptSchemaTest(unittest.TestCase):
     def test_full(self) -> None:
         text = (
@@ -987,6 +998,40 @@ class RunEstimateTest(unittest.TestCase):
         estimate = m.build_run_estimate(cfg, cfg.models)
         lines = m.format_run_estimate(estimate, cfg.output_dir, cfg.save_report)
         self.assertTrue(any(line.startswith("Output dir: ") for line in lines))
+
+    def test_long_context_probe_increases_input_estimate(self) -> None:
+        cfg = m.AuditConfig(
+            make_config(),
+            ["gpt-4o"],
+            None,
+            None,
+            False,
+            False,
+            "reports",
+            False,
+            mode="quick",
+            long_context="32k",
+        )
+        estimate = m.build_run_estimate(cfg, cfg.models)
+        self.assertEqual(estimate.probes_by_model["gpt-4o"], 3)
+        self.assertGreater(estimate.estimated_input_tokens, 30_000)
+
+
+class LongContextProbeTest(unittest.TestCase):
+    def test_resolve_standard_profiles_and_model_max(self) -> None:
+        self.assertEqual(m.resolve_long_context_tokens("gpt-4o", "32k"), 32_000)
+        self.assertEqual(m.resolve_long_context_tokens("claude-sonnet-4-6", "max"), 200_000)
+        self.assertEqual(m.resolve_long_context_tokens("gemini-2.0-flash", "max"), 1_000_000)
+        self.assertEqual(m.resolve_long_context_tokens("gpt-4o", "off"), None)
+
+    def test_build_long_context_probe_contains_needle(self) -> None:
+        probe = m.build_long_context_probe("gpt-4o", "off", explicit_tokens=2048)
+        self.assertIsNotNone(probe)
+        assert probe is not None
+        self.assertEqual(probe.scorer_id, "long_context_retrieval")
+        self.assertIn(m.LONG_CONTEXT_NEEDLE, probe.user)
+        self.assertGreater(m.estimate_probe_input_tokens(probe), 1800)
+
 
 
 class DecisionSummaryTest(unittest.TestCase):

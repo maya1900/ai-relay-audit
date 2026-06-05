@@ -6,6 +6,8 @@ from typing import Any
 
 
 PDF_MAGIC_STRING = "AI-RELAY-AUDIT-PDF-MAGIC-7F3K"
+LONG_CONTEXT_NEEDLE = "AI-RELAY-AUDIT-LONG-CONTEXT-9Q4M"
+LONG_CONTEXT_CHECKSUM = 73421
 
 
 def family_for_model(model: str) -> str:
@@ -510,6 +512,26 @@ def score_openai_json_schema(
     ]
     score, details = _weighted_protocol_score(checks)
     prefix = "OpenAI json_schema 协议正常" if score >= 90 else "OpenAI json_schema 协议存在偏差"
+    return score, f"{prefix}：{details}"
+
+
+def score_long_context_retrieval(text: str) -> tuple[float, str]:
+    obj = extract_json_object(text)
+    marker_text = text
+    if isinstance(obj, dict):
+        marker_text = json.dumps(obj, ensure_ascii=False)
+    marker_ok = LONG_CONTEXT_NEEDLE in marker_text
+    position_ok = isinstance(obj, dict) and str(obj.get("position", "")).strip().lower() == "middle"
+    checksum_ok = isinstance(obj, dict) and obj.get("checksum") == LONG_CONTEXT_CHECKSUM
+    json_ok = isinstance(obj, dict)
+    checks = [
+        ("needle", marker_ok, 55),
+        ("position", position_ok, 15),
+        ("checksum", checksum_ok, 20),
+        ("json", json_ok, 10),
+    ]
+    score, details = _weighted_protocol_score(checks)
+    prefix = "长上下文 needle 检索正常" if score >= 90 else "长上下文 needle 检索存在偏差"
     return score, f"{prefix}：{details}"
 
 

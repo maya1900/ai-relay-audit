@@ -4,7 +4,7 @@ import os
 import re
 
 from .models import ApiConfig, AuditConfig, ModelCostEstimate, ModelPricing, Probe, RunEstimate
-from .probes import applicable_probes
+from .probes import audit_probes_for_model
 from .api import reasoning_token_budget
 from .scoring import is_reasoning_model
 
@@ -79,7 +79,14 @@ def build_run_estimate(cfg: AuditConfig, models: list[str]) -> RunEstimate:
     max_output_tokens = 0
     estimated_input_tokens = 0
     for model in models:
-        probes = applicable_probes(model, cfg.all_targeted, cfg.probes_config, cfg.mode)
+        probes = audit_probes_for_model(
+            model,
+            cfg.all_targeted,
+            cfg.probes_config,
+            cfg.mode,
+            cfg.long_context,
+            cfg.long_context_tokens,
+        )
         probe_count = len(probes)
         probes_by_model[model] = probe_count
         probe_requests += probe_count

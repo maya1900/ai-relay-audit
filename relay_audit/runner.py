@@ -11,7 +11,7 @@ from .api import fetch_models, preflight_check
 from .models import ApiConfig, AuditConfig, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT, ProbeResult
 from .pricing import build_run_estimate, format_run_estimate
 from .probe_runner import run_probe
-from .probes import applicable_probes, configured_probes
+from .probes import audit_probes_for_model, configured_probes
 from .reporters import ConsoleReporter, Reporter
 from .reporting import (
     authenticity_note,
@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     generate.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Request timeout seconds. Default: {DEFAULT_TIMEOUT}.")
     generate.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help=f"Max output tokens per probe. Default: {DEFAULT_MAX_TOKENS}.")
     generate.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature. Default: 0.")
+    generate.add_argument("--long-context", default="off", choices=["off", "32k", "100k", "200k", "max"], help="Optional long-context probe profile. Default: off.")
+    generate.add_argument("--long-context-tokens", type=int, help="Override long-context input token target.")
     generate.add_argument("--all-targeted", action="store_true", help="Run all targeted probes instead of model-family targeted probes.")
     generate.add_argument("--hide-prompts", action="store_true", help="Hide prompts in console output.")
 
@@ -124,6 +126,8 @@ def baseline_config_from_args(args: argparse.Namespace) -> AuditConfig:
         baseline=None,
         probes_config=None,
         mode="full",
+        long_context=str(getattr(args, "long_context", "off") or "off"),
+        long_context_tokens=getattr(args, "long_context_tokens", None),
     )
 
 
@@ -246,6 +250,9 @@ def run_audit(
     reporter.info(f"Output dir: {os.path.abspath(cfg.output_dir)}")
     reporter.info("说明: 真假检测为黑盒一致性评估，不是供应商级证明。")
     reporter.section("运行前确认")
+    if cfg.long_context != "off" or cfg.long_context_tokens:
+        token_text = f", target_tokens={cfg.long_context_tokens}" if cfg.long_context_tokens else ""
+        reporter.info(f"Long context probe: {cfg.long_context}{token_text} (included in input-token and cost estimates)")
     for line in format_run_estimate(estimate, cfg.output_dir, cfg.save_report):
         reporter.info(line)
 
@@ -256,7 +263,14 @@ def run_audit(
             was_cancelled = True
             break
         reporter.section(f"开始检测模型: {model} | family={family_for_model(model)}")
-        probes = applicable_probes(model, cfg.all_targeted, cfg.probes_config, cfg.mode)
+        probes = audit_probes_for_model(
+            model,
+            cfg.all_targeted,
+            cfg.probes_config,
+            cfg.mode,
+            cfg.long_context,
+            cfg.long_context_tokens,
+        )
         total = len(probes)
         results: list[ProbeResult] = []
         for index, probe in enumerate(probes, 1):

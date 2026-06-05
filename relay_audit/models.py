@@ -42,6 +42,8 @@ class AuditConfig:
     baseline: str | None = None
     probes_config: str | None = None
     mode: str = "standard"  # quick, standard, full
+    long_context: str = "off"  # off, 32k, 100k, 200k, max
+    long_context_tokens: int | None = None
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "AuditConfig":
@@ -69,6 +71,8 @@ class AuditConfig:
             baseline=getattr(args, "baseline", None) or None,
             probes_config=getattr(args, "probes_config", None) or None,
             mode=getattr(args, "mode", "standard") or "standard",
+            long_context=getattr(args, "long_context", "off") or "off",
+            long_context_tokens=getattr(args, "long_context_tokens", None),
         )
 
 

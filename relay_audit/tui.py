@@ -43,6 +43,8 @@ def make_namespace_from_tui(state: dict[str, Any]) -> argparse.Namespace:
         temperature=float(str(state["temperature"]).strip() or 0),
         api_style=str(state.get("api_style", "auto")).strip() or "auto",
         mode=str(state.get("mode", "standard")).strip() or "standard",
+        long_context=str(state.get("long_context", "off")).strip() or "off",
+        long_context_tokens=None,
         output_dir=str(state["output_dir"]).strip() or "reports",
         save_report=bool(state.get("save_report")),
         all_targeted=bool(state["all_targeted"]),
@@ -196,6 +198,7 @@ class TuiApp:
             "temperature": "0",
             "api_style": "auto",
             "mode": "standard",
+            "long_context": "off",
             "output_dir": "reports",
             "save_report": False,
             "all_targeted": False,
@@ -212,6 +215,7 @@ class TuiApp:
             ("temperature", "Temperature"),
             ("api_style", "API style"),
             ("mode", "Mode"),
+            ("long_context", "Long context"),
             ("output_dir", "Output dir"),
             ("save_report", "Save report file"),
             ("all_targeted", "All targeted probes"),
@@ -228,6 +232,7 @@ class TuiApp:
             "temperature": "随机性",
             "api_style": "接口风格",
             "mode": "检测模式",
+            "long_context": "长上下文",
             "output_dir": "输出目录",
             "save_report": "保存报告",
             "all_targeted": "全量探针",
@@ -303,6 +308,10 @@ class TuiApp:
                 "Detection mode: quick (fast validation), standard (balanced), or full (comprehensive).",
                 "quick = 2 probes, standard = 7 probes (default), full = all targeted probes.",
             ),
+            "long_context": (
+                "Optional needle-in-haystack long-context probe: off, 32k, 100k, 200k, or max.",
+                "Leave off unless you explicitly accept the extra prompt cost.",
+            ),
             "output_dir": (
                 "Directory used only when Save report file is enabled.",
                 "Keep reports unless you want saved files in a different folder.",
@@ -331,6 +340,7 @@ class TuiApp:
             "temperature": ("采样随机性。检测建议保持确定性。", "保持 0 以便复测结果更稳定。"),
             "api_style": ("调用协议：auto、openai-chat、openai-responses、anthropic 或 gemini。", "通常保持 auto；失败时再手动切换协议复测。"),
             "mode": ("检测模式：quick（快速）、standard（标准）或 full（完整）。", "quick=2探针，standard=7探针（默认），full=含所有针对性探针。"),
+            "long_context": ("可选长上下文 needle 检索：off、32k、100k、200k 或 max。", "默认关闭；开启前确认弹窗会显示额外 token 和费用预估。"),
             "output_dir": ("保存报告时使用的目录。", "默认 reports；需要保存到别处时再修改。"),
             "save_report": ("检测完成后自动保存 Markdown 和 JSON 报告。", "快速检查可关闭；完成后也可按 s 手动保存。"),
             "all_targeted": ("对当前模型同时运行 GPT 和 Claude 针对性探针。", "常规检测关闭；怀疑模型冒充时开启。"),
@@ -656,13 +666,14 @@ class TuiApp:
                 f"预估输入 token：{estimate.estimated_input_tokens}",
                 f"最大输出 token 预算：{estimate.max_output_tokens}",
                 cost_line,
+                f"长上下文：{cfg.long_context}",
                 f"每个模型探针数：{per_model}",
                 "每个模型费用：" + "，".join(cost_parts),
                 f"输出目录：{os.path.abspath(cfg.output_dir)}",
                 f"自动保存报告：{'是' if self.state['save_report'] else '否'}",
             ]
         else:
-            lines = ["Run this audit?", ""] + format_run_estimate(
+            lines = ["Run this audit?", "", f"Long context: {cfg.long_context}"] + format_run_estimate(
                 estimate, cfg.output_dir, bool(self.state["save_report"]), include_ping=True
             )
         height, width = self.stdscr.getmaxyx()
@@ -713,6 +724,11 @@ class TuiApp:
             modes = ["quick", "standard", "full"]
             current = str(self.state[key]).lower()
             self.state[key] = modes[(modes.index(current) + 1) % len(modes)] if current in modes else "standard"
+            return
+        if key == "long_context":
+            profiles = ["off", "32k", "100k", "200k", "max"]
+            current = str(self.state[key]).lower()
+            self.state[key] = profiles[(profiles.index(current) + 1) % len(profiles)] if current in profiles else "off"
             return
         # 编辑弹窗需要显示光标，便于确认当前插入/删除位置。
         curses.curs_set(1)

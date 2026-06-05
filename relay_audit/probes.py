@@ -19,11 +19,14 @@ from .scoring import (
     score_identity,
     score_instruction_resistance,
     score_json_contract,
+    score_long_context_retrieval,
     score_openai_json_schema,
     score_openai_tool_calls,
     score_protocol_fingerprint,
     score_reasoning,
     score_stream_consistency,
+    LONG_CONTEXT_CHECKSUM,
+    LONG_CONTEXT_NEEDLE,
 )
 
 
@@ -44,6 +47,7 @@ SCORER_REGISTRY: dict[str, Callable[[str], tuple[float, str]]] = {
     "claude_sse_protocol": score_claude_sse_protocol,
     "openai_tool_calls": score_openai_tool_calls,
     "openai_json_schema_protocol": score_openai_json_schema,
+    "long_context_retrieval": score_long_context_retrieval,
     "protocol_fingerprint": score_protocol_fingerprint,
     "stream_consistency": score_stream_consistency,
 }
@@ -358,4 +362,119 @@ def applicable_probes(
             # targeted 探针需要检查模型家族匹配
             if include_all_targeted or family in probe.families:
                 probes.append(probe)
+    return probes
+
+
+LONG_CONTEXT_PROFILES = {
+    "off": 0,
+    "32k": 32_000,
+    "100k": 100_000,
+    "200k": 200_000,
+}
+
+
+def normalize_long_context(value: str | None) -> str:
+    normalized = (value or "off").strip().lower().replace("_", "-")
+    aliases = {
+        "none": "off",
+        "false": "off",
+        "0": "off",
+        "32": "32k",
+        "32000": "32k",
+        "100": "100k",
+        "100000": "100k",
+        "200": "200k",
+        "200000": "200k",
+        "maximum": "max",
+        "model-max": "max",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {*LONG_CONTEXT_PROFILES, "max"}:
+        raise ValueError("long_context must be one of: off, 32k, 100k, 200k, max")
+    return normalized
+
+
+def model_context_limit(model: str) -> int:
+    lowered = model.lower()
+    if "gemini" in lowered:
+        return 1_000_000
+    if "gpt-4.1" in lowered:
+        return 1_000_000
+    if "claude" in lowered or "sonnet" in lowered or "opus" in lowered or "haiku" in lowered:
+        return 200_000
+    return 128_000
+
+
+def resolve_long_context_tokens(model: str, profile: str | None, explicit_tokens: int | None = None) -> int | None:
+    if explicit_tokens is not None:
+        if explicit_tokens <= 0:
+            raise ValueError("long_context_tokens must be positive")
+        return explicit_tokens
+    normalized = normalize_long_context(profile)
+    if normalized == "off":
+        return None
+    if normalized == "max":
+        return model_context_limit(model)
+    return LONG_CONTEXT_PROFILES[normalized]
+
+
+def build_long_context_user_prompt(target_tokens: int) -> str:
+    target_tokens = max(512, target_tokens)
+    header = (
+        "Needle-in-haystack long-context audit. Most lines below are filler. "
+        "Find the single NEEDLE line and return only JSON with keys marker, position, checksum. "
+        f"Use position \"middle\" and checksum {LONG_CONTEXT_CHECKSUM}.\n\n"
+    )
+    needle = f"NEEDLE: {LONG_CONTEXT_NEEDLE}\n\n"
+    footer = "\nReturn only JSON now."
+    target_chars = max(0, target_tokens * 4 - len(header) - len(needle) - len(footer))
+    prefix_chars = int(target_chars * 0.55)
+    suffix_chars = target_chars - prefix_chars
+
+    def filler(size: int, offset: int = 0) -> str:
+        unit = "FILLER {index:06d}: relay audit context padding; this line has no needle or answer.\n"
+        chunks: list[str] = []
+        total = 0
+        index = offset
+        while total < size:
+            line = unit.format(index=index)
+            chunks.append(line)
+            total += len(line)
+            index += 1
+        return "".join(chunks)[:size]
+
+    return header + filler(prefix_chars) + needle + filler(suffix_chars, 500_000) + footer
+
+
+def build_long_context_probe(model: str, profile: str | None, explicit_tokens: int | None = None) -> Probe | None:
+    tokens = resolve_long_context_tokens(model, profile, explicit_tokens)
+    if tokens is None:
+        return None
+    label = f"{tokens // 1000}k" if tokens >= 1000 else str(tokens)
+    return Probe(
+        probe_id=f"long_context_{label}",
+        title=f"长上下文检索：{label} needle-in-haystack",
+        category="universal",
+        weight=20,
+        families=("unknown", "gpt", "claude", "gemini"),
+        system="You are being audited for long-context retrieval. Return only JSON.",
+        user=build_long_context_user_prompt(tokens),
+        scorer=score_long_context_retrieval,
+        scorer_id="long_context_retrieval",
+        mode="full",
+    )
+
+
+def audit_probes_for_model(
+    model: str,
+    include_all_targeted: bool,
+    probes_config: str | None = None,
+    mode: str = "standard",
+    long_context: str | None = "off",
+    long_context_tokens: int | None = None,
+) -> list[Probe]:
+    probes = applicable_probes(model, include_all_targeted, probes_config, mode)
+    long_context_probe = build_long_context_probe(model, long_context, long_context_tokens)
+    if long_context_probe is not None:
+        probes.append(long_context_probe)
     return probes

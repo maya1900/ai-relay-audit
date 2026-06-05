@@ -60,6 +60,8 @@ TUI 检测完成后会直接把 Markdown 报告展示在右侧日志里。默认
 - `standard`：标准模式（默认），运行 7-8 个探针，包含通用能力、协议指纹、thinking signature 等，覆盖大部分常见问题。
 - `full`：完整模式，运行所有探针（含协议级 detector 和所有针对性探针），适合全面评估或怀疑模型冒充时使用。
 
+`Long context` 默认关闭。需要测试长上下文时可在 TUI 中切换为 `32k`、`100k`、`200k` 或 `max`，工具会追加一条 needle-in-haystack 检索探针。运行前确认弹窗会把这条请求计入输入 token 和官方价格上限预估；`max` 使用内置模型上下文上限估计（Claude 200k、Gemini 1M、GPT-4.1 1M、其他模型保守按 128k）。
+
 ## API 协议风格
 
 `API style` 用来选择模型调用协议：
@@ -99,6 +101,7 @@ Timeout            请求超时秒数，默认 90
 Max tokens         每次检测最大输出 token，默认 900
 Temperature        默认 0
 API style          auto/openai-responses/openai-chat/anthropic/gemini，默认 auto
+Long context       off/32k/100k/200k/max，默认 off；开启会显著增加输入 token 成本
 ```
 
 ## 外部探针配置
@@ -140,6 +143,7 @@ API style          auto/openai-responses/openai-chat/anthropic/gemini，默认 a
 - 通用多约束推理：15
 - 通用提示注入抵抗：15
 - 通用代码任务能力：15
+- 可选长上下文 needle 检索：20（仅 Long context 非 off 时追加）
 - Stream/Non-stream 响应一致性：10
 - 身份自述与黑盒限制意识：5
 - 协议指纹（usage 字段一致性）：10
@@ -209,7 +213,7 @@ python3 ai_relay_audit.py baseline generate --provider openai --model gpt-4o
 python3 ai_relay_audit.py baseline compare --model gpt-4o --current reports/audit_report_YYYYMMDD_HHMMSS.json
 ```
 
-`baseline generate` 默认写入 `data/baselines/{model}_full.json`，OpenAI/Anthropic/Gemini 分别读取 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY`/`GOOGLE_API_KEY`，也可以显式传 `--api-key`、`--base-url`、`--api-style`。对比结果会报告模型增删、能力/可用性变化、probe 分数变化，以及 usage keys、response_data keys、content block types、tool_calls、SSE 事件序列等协议字段差异。
+`baseline generate` 默认写入 `data/baselines/{model}_full.json`，OpenAI/Anthropic/Gemini 分别读取 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY`/`GOOGLE_API_KEY`，也可以显式传 `--api-key`、`--base-url`、`--api-style`。如需把官方长上下文结果也纳入 baseline，可加 `--long-context 32k|100k|200k|max`。对比结果会报告模型增删、能力/可用性变化、probe 分数变化，以及 usage keys、response_data keys、content block types、tool_calls、SSE 事件序列等协议字段差异。
 
 ## 项目结构
 
