@@ -387,6 +387,61 @@ def _delta(current: Any, baseline: Any) -> float | None:
         return None
 
 
+def _probe_field_signature(item: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    signature: dict[str, Any] = {}
+    usage = item.get("usage")
+    if isinstance(usage, dict):
+        signature["usage_keys"] = sorted(str(key) for key in usage)
+    response_data = item.get("response_data")
+    if isinstance(response_data, dict):
+        signature["response_data_keys"] = sorted(str(key) for key in response_data)
+        content = response_data.get("content")
+        if isinstance(content, list):
+            signature["content_types"] = sorted(
+                str(block.get("type"))
+                for block in content
+                if isinstance(block, dict) and block.get("type")
+            )
+        choices = response_data.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            message = choices[0].get("message")
+            if isinstance(message, dict):
+                signature["message_keys"] = sorted(str(key) for key in message)
+                tool_calls = message.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    signature["tool_call_types"] = sorted(
+                        str(call.get("type"))
+                        for call in tool_calls
+                        if isinstance(call, dict) and call.get("type")
+                    )
+        events = response_data.get("events")
+        if isinstance(events, list):
+            names = []
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                event_name = event.get("event")
+                data = event.get("data")
+                if not event_name and isinstance(data, dict):
+                    event_name = data.get("type")
+                if event_name:
+                    names.append(str(event_name))
+            signature["sse_events"] = names
+    return signature
+
+
+def _field_changes(before: dict[str, Any] | None, after: dict[str, Any] | None) -> list[dict[str, Any]]:
+    before_sig = _probe_field_signature(before)
+    after_sig = _probe_field_signature(after)
+    changes = []
+    for field in sorted(set(before_sig) | set(after_sig)):
+        if before_sig.get(field) != after_sig.get(field):
+            changes.append({"field": field, "before": before_sig.get(field), "after": after_sig.get(field)})
+    return changes
+
+
 def load_report_json(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as file:
         data = json.load(file)
@@ -421,7 +476,8 @@ def compare_reports(baseline: dict[str, Any], current: dict[str, Any]) -> dict[s
             old_status = old_probe.get("status")
             new_status = new_probe.get("status")
             score_delta = _delta(new_score, old_score)
-            if old_status != new_status or (score_delta is not None and abs(score_delta) >= 0.01):
+            field_changes = _field_changes(old_probe, new_probe)
+            if old_status != new_status or (score_delta is not None and abs(score_delta) >= 0.01) or field_changes:
                 probe_changes.append(
                     {
                         "probe_id": probe_id,
@@ -429,6 +485,7 @@ def compare_reports(baseline: dict[str, Any], current: dict[str, Any]) -> dict[s
                         "status_before": old_status,
                         "status_after": new_status,
                         "score_delta": score_delta,
+                        "field_changes": field_changes,
                     }
                 )
         cap_delta = _delta(after.get("capability"), before.get("capability"))
@@ -491,9 +548,13 @@ def format_comparison_markdown(comparison: dict[str, Any]) -> str:
             if probe_changes:
                 lines.extend(["", f"### Probe changes: {row['model']}", ""])
                 for change in probe_changes:
+                    field_changes = change.get("field_changes") or []
+                    field_text = ""
+                    if field_changes:
+                        field_text = "; fields: " + ", ".join(str(item.get("field")) for item in field_changes)
                     if change.get("change") == "changed":
                         lines.append(
-                            f"- {change['probe_id']}: {change.get('status_before')} → {change.get('status_after')}, score Δ {_format_delta(change.get('score_delta'))}"
+                            f"- {change['probe_id']}: {change.get('status_before')} → {change.get('status_after')}, score Δ {_format_delta(change.get('score_delta'))}{field_text}"
                         )
                     else:
                         lines.append(f"- {change['probe_id']}: {change.get('change')}")
@@ -642,6 +703,7 @@ def write_reports(output_dir: str, model_results: dict[str, list[ProbeResult]], 
                     "usage": result.usage,
                     "error": result.error,
                     "response": result.response,
+                    "response_data": result.response_data,
                 }
                 for result in results
             ]
@@ -681,6 +743,7 @@ def report_dict_from_results(model_results: dict[str, list[ProbeResult]], config
                     "usage": result.usage,
                     "error": result.error,
                     "response": result.response,
+                    "response_data": result.response_data,
                 }
                 for result in results
             ]

@@ -58,7 +58,7 @@ TUI 检测完成后会直接把 Markdown 报告展示在右侧日志里。默认
 
 - `quick`：快速验证模式，仅运行 2 个核心探针（JSON 输出、身份自述），适合快速检查模型是否可用。
 - `standard`：标准模式（默认），运行 7-8 个探针，包含通用能力、协议指纹、thinking signature 等，覆盖大部分常见问题。
-- `full`：完整模式，运行所有探针（含所有针对性探针），适合全面评估或怀疑模型冒充时使用。
+- `full`：完整模式，运行所有探针（含协议级 detector 和所有针对性探针），适合全面评估或怀疑模型冒充时使用。
 
 ## API 协议风格
 
@@ -124,7 +124,7 @@ API style          auto/openai-responses/openai-chat/anthropic/gemini，默认 a
 }
 ```
 
-`scorer` 只能使用内置评分器 ID（例如 `json_contract`、`reasoning`、`instruction_resistance`、`code_task`、`identity`、`claude_xml`、`claude_safety`、`gpt_schema`、`gpt_math`、`claude_thinking_signature`、`protocol_fingerprint`、`stream_consistency`），不会执行外部代码。
+`scorer` 只能使用内置评分器 ID（例如 `json_contract`、`reasoning`、`instruction_resistance`、`code_task`、`identity`、`claude_xml`、`claude_safety`、`gpt_schema`、`gpt_math`、`claude_thinking_signature`、`claude_pdf`、`claude_tool_use`、`claude_message_protocol`、`claude_sse_protocol`、`openai_tool_calls`、`openai_json_schema_protocol`、`protocol_fingerprint`、`stream_consistency`），不会执行外部代码。
 
 ## 评分口径
 
@@ -147,9 +147,11 @@ API style          auto/openai-responses/openai-chat/anthropic/gemini，默认 a
   - XML 长指令处理：10
   - 安全边界与替代方案：10
   - **thinking signature 加密签名验证：25（真伪验证金标准）**
+  - full 模式协议检测：Messages 响应结构、tool_use、PDF 文档输入、SSE 事件序列：各 15
 - GPT 针对性探针：
   - 函数调用式 JSON：20
   - 紧凑数学推理：20
+  - full 模式协议检测：真实 tool_calls、response_format json_schema：各 15
 
 **关于 Stream/Non-stream 一致性检测：**
 
@@ -197,6 +199,17 @@ API style          auto/openai-responses/openai-chat/anthropic/gemini，默认 a
 - `reports/audit_report_YYYYMMDD_HHMMSS.json`
 
 Markdown 适合人工查看，JSON 适合后续自动分析或归档。
+
+## 官方 Baseline
+
+可以先用官方 API 跑 full 模式生成固定 baseline，再把中转站报告与它对比：
+
+```bash
+python3 ai_relay_audit.py baseline generate --provider openai --model gpt-4o
+python3 ai_relay_audit.py baseline compare --model gpt-4o --current reports/audit_report_YYYYMMDD_HHMMSS.json
+```
+
+`baseline generate` 默认写入 `data/baselines/{model}_full.json`，OpenAI/Anthropic/Gemini 分别读取 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY`/`GOOGLE_API_KEY`，也可以显式传 `--api-key`、`--base-url`、`--api-style`。对比结果会报告模型增删、能力/可用性变化、probe 分数变化，以及 usage keys、response_data keys、content block types、tool_calls、SSE 事件序列等协议字段差异。
 
 ## 项目结构
 

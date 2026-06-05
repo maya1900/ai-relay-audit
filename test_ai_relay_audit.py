@@ -1254,6 +1254,65 @@ class CompareReportTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.load_report_json(path)
 
+    def test_compare_reports_detects_usage_field_delta(self) -> None:
+        baseline = self._report(80)
+        current = self._report(80)
+        baseline["models"]["gpt-4o"][0]["usage"] = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        current["models"]["gpt-4o"][0]["usage"] = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+
+        comparison = m.compare_reports(baseline, current)
+
+        change = comparison["changed_models"][0]["probe_changes"][0]
+        fields = {item["field"] for item in change["field_changes"]}
+        self.assertIn("usage_keys", fields)
+        self.assertIn("usage_keys", m.format_comparison_markdown(comparison))
+
+
+class BaselineFlowTest(unittest.TestCase):
+    def test_baseline_path_sanitizes_model_name(self) -> None:
+        self.assertEqual(
+            m.baseline_path_for_model("openai/gpt-4o latest", "/tmp/baselines"),
+            "/tmp/baselines/openai_gpt-4o_latest_full.json",
+        )
+
+    def test_baseline_config_uses_provider_defaults(self) -> None:
+        args = argparse.Namespace(
+            provider="openai",
+            model="gpt-4o",
+            base_url=None,
+            api_key=None,
+            api_style=None,
+            output_dir="data/baselines",
+            timeout=30,
+            max_tokens=900,
+            temperature=0.0,
+            all_targeted=False,
+            hide_prompts=True,
+        )
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-official"}):
+            cfg = m.baseline_config_from_args(args)
+
+        self.assertEqual(cfg.api.base_url, "https://api.openai.com")
+        self.assertEqual(cfg.api.api_key, "sk-official")
+        self.assertEqual(cfg.api.api_style, "auto")
+        self.assertEqual(cfg.mode, "full")
+        self.assertFalse(cfg.save_report)
+        self.assertTrue(cfg.hide_prompts)
+
+    def test_write_json_atomic_creates_parent_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "data", "baselines", "gpt-4o_full.json")
+            m.write_json_atomic(path, {"models": {}})
+            with open(path, encoding="utf-8") as file:
+                data = json.load(file)
+        self.assertEqual(data, {"models": {}})
+
+    def test_report_dict_preserves_response_data_for_protocol_diff(self) -> None:
+        result = make_result("openai_tool_calls", "targeted", 15, "ok", 100)
+        result.response_data = {"id": "chatcmpl-1", "choices": []}
+        data = m.report_dict_from_results({"gpt-4o": [result]}, make_config())
+        self.assertEqual(data["models"]["gpt-4o"][0]["response_data"]["id"], "chatcmpl-1")
+
 
 class ProbeConfigTest(unittest.TestCase):
     def _config_path(
