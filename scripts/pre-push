@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel)"
+python3 "$repo_root/scripts/bump_patch_version.py" --pre-push "${1:-origin}" "${2:-}"

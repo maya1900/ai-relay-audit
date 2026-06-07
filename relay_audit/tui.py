@@ -26,6 +26,7 @@ from .reporters import TuiReporter
 from .reporting import build_decision_summary, build_report, format_suggestions, suggest_next_steps, write_reports
 from .scoring import family_for_model
 from .utils import filter_models
+from .version import PROJECT_NAME, __version__, fetch_remote_version, is_newer_version
 
 
 def make_namespace_from_tui(state: dict[str, Any]) -> argparse.Namespace:
@@ -268,6 +269,9 @@ class TuiApp:
         self.last_report_output_dir: str | None = None
         self.last_saved_paths: tuple[str, str] | None = None
         self.last_report_unsaved = False
+        self.remote_version: str | None = None
+        self.version_check_done = False
+        self.start_version_check()
         self.help_text: dict[str, tuple[str, str]] = {
             "base_url": (
                 "Relay endpoint, for example https://api.example.com or https://api.example.com/v1.",
@@ -349,6 +353,30 @@ class TuiApp:
         }
 
     # ---- curses helpers -------------------------------------------------
+
+    def start_version_check(self) -> None:
+        thread = threading.Thread(target=self.check_version_worker, daemon=True)
+        thread.start()
+
+    def check_version_worker(self) -> None:
+        self.remote_version = fetch_remote_version()
+        self.version_check_done = True
+
+    def project_version_text(self) -> str:
+        if self.remote_version and is_newer_version(self.remote_version, __version__):
+            return self.text(
+                f"Author: maya1900 | {PROJECT_NAME} v{__version__} -> v{self.remote_version}",
+                f"作者: maya1900 | {PROJECT_NAME} v{__version__} -> v{self.remote_version}",
+            )
+        if not self.version_check_done:
+            return self.text(
+                f"Author: maya1900 | {PROJECT_NAME} v{__version__} checking",
+                f"作者: maya1900 | {PROJECT_NAME} v{__version__} 检测更新中",
+            )
+        return self.text(
+            f"Author: maya1900 | {PROJECT_NAME} v{__version__}",
+            f"作者: maya1900 | {PROJECT_NAME} v{__version__}",
+        )
 
     @staticmethod
     def _safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -954,7 +982,7 @@ class TuiApp:
             return
 
         self._safe_addstr(self.stdscr, 0, 2, "AI Relay Audit TUI", title_attr)
-        repo_text = self.text("Author: maya1900 | Git: local ai-relay-audit", "作者: maya1900 | Git: 本地 ai-relay-audit")
+        repo_text = self.project_version_text()
         self._safe_addstr(self.stdscr, 0, max(20, width - display_width(repo_text) - 2), repo_text, warn_attr)
         with contextlib.suppress(curses.error):
             self.stdscr.hline(1, 0, "-", width)

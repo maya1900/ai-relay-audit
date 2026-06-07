@@ -1190,6 +1190,37 @@ class TuiSaveTest(unittest.TestCase):
         self.assertIn("Markdown: old.md", app.logs)
 
 
+class VersionTest(unittest.TestCase):
+    def test_parse_version_text_reads_project_version(self) -> None:
+        self.assertEqual(m.parse_version_text('__version__ = "1.2.3"\n'), "1.2.3")
+        self.assertIsNone(m.parse_version_text("VERSION = '1.2.3'\n"))
+
+    def test_is_newer_version_compares_semver_parts(self) -> None:
+        self.assertTrue(m.is_newer_version("1.0.1", "1.0.0"))
+        self.assertTrue(m.is_newer_version("1.1.0", "1.0.9"))
+        self.assertFalse(m.is_newer_version("1.0.0", "1.0.0"))
+
+    def test_tui_project_version_text_replaces_git_local_label(self) -> None:
+        app = m.TuiApp.__new__(m.TuiApp)
+        app.language = "zh"
+        app.remote_version = None
+        app.version_check_done = True
+
+        text = app.project_version_text()
+
+        self.assertIn("ai-relay-audit", text)
+        self.assertIn(f"v{m.__version__}", text)
+        self.assertNotIn("Git: 本地", text)
+
+    def test_tui_project_version_text_shows_available_update(self) -> None:
+        app = m.TuiApp.__new__(m.TuiApp)
+        app.language = "en"
+        app.remote_version = "99.0.0"
+        app.version_check_done = True
+
+        self.assertIn(f"v{m.__version__} -> v99.0.0", app.project_version_text())
+
+
 class TuiKeyTest(unittest.TestCase):
     def test_x_clears_live_logs_only(self) -> None:
         app = m.TuiApp.__new__(m.TuiApp)

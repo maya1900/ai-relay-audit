@@ -9,3 +9,4 @@ from .runner import *
 from .scoring import *
 from .tui import *
 from .utils import *
+from .version import *

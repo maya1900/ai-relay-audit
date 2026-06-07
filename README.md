@@ -242,6 +242,25 @@ relay_audit/reporting.py 报告、评分汇总、baseline 对比
 relay_audit/reporters.py 审计过程输出适配
 relay_audit/tui.py      curses TUI
 relay_audit/runner.py   审计主流程和入口参数
+relay_audit/version.py  项目版本和更新检测
+scripts/pre-push        推送前自动 patch 版本 hook
+```
+
+## 版本发布
+
+TUI 右上角显示当前项目版本，并在后台检查 GitHub master 上的最新版本；发现远端版本更新时会显示 `v当前 -> v最新`。
+
+安装本地推送 hook 后，每次 `git push` 会自动递增 `relay_audit/version.py` 的 patch 版本，创建 `chore: bump version to x.y.z` 提交并推送：
+
+```bash
+cp scripts/pre-push .git/hooks/pre-push
+chmod +x .git/hooks/pre-push scripts/pre-push scripts/bump_patch_version.py
+```
+
+如需临时跳过自动 bump：
+
+```bash
+AI_RELAY_AUDIT_SKIP_VERSION_BUMP=1 git push
 ```
 
 ## 端到端验收
