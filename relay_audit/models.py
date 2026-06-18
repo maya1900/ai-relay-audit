@@ -7,6 +7,8 @@ from typing import Any, Callable
 
 DEFAULT_TIMEOUT = 90
 DEFAULT_MAX_TOKENS = 900
+DEFAULT_OPENAI_SDK_VERSION = "1.93.0"
+DEFAULT_USER_AGENT = f"OpenAI/Python {DEFAULT_OPENAI_SDK_VERSION}"
 
 
 @dataclasses.dataclass
@@ -17,6 +19,7 @@ class ApiConfig:
     max_tokens: int
     temperature: float
     api_style: str = "auto"
+    user_agent: str = DEFAULT_USER_AGENT
     # auto 模式下，按模型缓存首个成功的调用协议，避免后续探针重复试错。
     resolved_styles: dict[str, str] = dataclasses.field(
         default_factory=dict, repr=False, compare=False
@@ -56,6 +59,7 @@ class AuditConfig:
             max_tokens=int(getattr(args, "max_tokens", DEFAULT_MAX_TOKENS) or DEFAULT_MAX_TOKENS),
             temperature=float(getattr(args, "temperature", 0.0) or 0.0),
             api_style=getattr(args, "api_style", "auto") or "auto",
+            user_agent=str(getattr(args, "user_agent", DEFAULT_USER_AGENT)).strip(),
         )
         raw_models = getattr(args, "models", None)
         models = [item.strip() for item in raw_models.split(",") if item.strip()] if raw_models else []

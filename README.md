@@ -83,9 +83,13 @@ python3 ai_relay_audit.py audit --base-url https://relay.example.com --api-key "
 - `openai-responses`：强制使用 OpenAI `/v1/responses`。
 - `openai-chat`：强制使用 OpenAI 兼容 `/v1/chat/completions`。
 - `anthropic`：强制使用 Anthropic 风格 `/v1/messages`。
-- `gemini`：强制使用 Google Gemini API `/v1/models/{model}:generateContent`。
+- `gemini`：强制使用原生 Google Gemini API `/v1/models/{model}:generateContent`，API key 放在 URL `key` 参数中；若中转站只支持 OpenAI 兼容 Gemini，请改用 `openai-chat`。
 
-很多中转站虽然模型名是 Claude，但仍然做成 OpenAI 兼容接口；也有站点对 GPT 新模型只重点支持 `/v1/responses`。Gemini 模型的中转站可能使用原生 Gemini API 或 OpenAI 兼容接口。
+很多中转站虽然模型名是 Claude，但仍然做成 OpenAI 兼容接口；也有站点对 GPT 新模型只重点支持 `/v1/responses`。Gemini 模型的中转站可能使用原生 Gemini API，也可能只暴露 OpenAI 兼容 `/v1/chat/completions`；后者请手动选择 `openai-chat`。
+
+工具会按协议隔离请求头：OpenAI 兼容接口使用 `Authorization: Bearer ...`；Anthropic Messages 使用 `x-api-key` 和 `anthropic-version`；原生 Gemini 使用 URL `key` 参数。这样可以减少中转站因混合客户端指纹或错误认证头返回 403 的概率。
+
+如果中转站返回 `channel:client_restricted` 或提示不允许当前 client，通常不是模型不可用，而是站点限制了 HTTP `User-Agent`。TUI 里选中 `User-Agent` / `客户端标识` 后按 Enter 可从不发送 User-Agent、OpenAI SDK、curl、Chrome、Safari 等预设中选择，也可进入自定义编辑；命令行可传 `--user-agent`，或设置 `AI_RELAY_USER_AGENT`。F5 获取模型列表遇到这类 403 时会静默尝试这些预设，只显示最终成功使用的客户端标识。
 
 脚本会自动读取当前目录的 `.env`（不会覆盖已经存在的环境变量），也可以在 TUI 里手动填写：
 
@@ -114,6 +118,7 @@ Timeout            请求超时秒数，默认 90
 Max tokens         每次检测最大输出 token，默认 900
 Temperature        默认 0
 API style          auto/openai-responses/openai-chat/anthropic/gemini，默认 auto
+User-Agent         请求使用的客户端标识；TUI 可选择不发送、预设或自定义，也可用 AI_RELAY_USER_AGENT 覆盖
 Mode               quick/standard/full，默认 standard
 Long context       off/32k/100k/200k/max，默认 off；开启会显著增加输入 token 成本
 ```

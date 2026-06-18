@@ -1,20 +1,48 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
+import platform
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable
 
-from .models import ApiConfig
+from .models import ApiConfig, DEFAULT_OPENAI_SDK_VERSION, DEFAULT_USER_AGENT
 from .scoring import PDF_MAGIC_STRING, family_for_model, is_reasoning_model
+from .utils import redact_secrets
 
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 ANTHROPIC_THINKING_BUDGET_TOKENS = 2048
 ANTHROPIC_THINKING_MAX_TOKENS = 4096
 ANTHROPIC_ADAPTIVE_THINKING_MAX_TOKENS = 8192
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _openai_sdk_headers(user_agent: str) -> dict[str, str]:
+    if not user_agent.startswith("OpenAI/Python"):
+        return {}
+    version = user_agent.removeprefix("OpenAI/Python").strip() or DEFAULT_OPENAI_SDK_VERSION
+    return {
+        "X-Stainless-Lang": "python",
+        "X-Stainless-Package-Version": version,
+        "X-Stainless-OS": platform.system() or "Unknown",
+        "X-Stainless-Arch": platform.machine() or "unknown",
+        "X-Stainless-Runtime": platform.python_implementation() or "CPython",
+        "X-Stainless-Runtime-Version": platform.python_version(),
+    }
+
+
+def lightweight_api_config(config: ApiConfig, timeout: int = 10, max_tokens: int = 16) -> ApiConfig:
+    """Build a low-cost config for reachability checks while preserving cached protocol state."""
+    return dataclasses.replace(
+        config,
+        timeout=max(1, min(config.timeout, timeout)),
+        max_tokens=max(1, min(config.max_tokens, max_tokens)),
+        temperature=0.0,
+    )
 
 
 def build_api_url(config: ApiConfig, path: str) -> str:
@@ -27,6 +55,61 @@ def build_api_url(config: ApiConfig, path: str) -> str:
     return f"{config.base_url}{prefix}{normalized_path}"
 
 
+def _json_headers(config: ApiConfig, include_openai_sdk_headers: bool) -> dict[str, str]:
+    user_agent = config.user_agent.strip()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    if user_agent and include_openai_sdk_headers:
+        headers.update(_openai_sdk_headers(user_agent))
+    return headers
+
+
+def _merge_headers(headers: dict[str, str], extra_headers: dict[str, str] | None = None) -> dict[str, str]:
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
+
+
+def build_request_headers(config: ApiConfig, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
+    headers = _json_headers(config, include_openai_sdk_headers=True)
+    headers["Authorization"] = f"Bearer {config.api_key}"
+    return _merge_headers(headers, extra_headers)
+
+
+def build_anthropic_request_headers(config: ApiConfig, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
+    headers = _json_headers(config, include_openai_sdk_headers=False)
+    headers.update({
+        "x-api-key": config.api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+    })
+    return _merge_headers(headers, extra_headers)
+
+
+def build_gemini_native_request_headers(config: ApiConfig, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
+    # Native Gemini calls pass the API key in the URL query. Do not also send it
+    # as an OpenAI-style Bearer token.
+    headers = _json_headers(config, include_openai_sdk_headers=False)
+    return _merge_headers(headers, extra_headers)
+
+
+def _headers_for_protocol(
+    config: ApiConfig,
+    header_protocol: str,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    if header_protocol == "openai":
+        return build_request_headers(config, extra_headers)
+    if header_protocol == "anthropic":
+        return build_anthropic_request_headers(config, extra_headers)
+    if header_protocol == "gemini-native":
+        return build_gemini_native_request_headers(config, extra_headers)
+    raise ValueError(f"Unsupported header protocol: {header_protocol}")
+
+
 def api_request(
     config: ApiConfig,
     method: str,
@@ -34,15 +117,11 @@ def api_request(
     payload: dict[str, Any] | None = None,
     extra_headers: dict[str, str] | None = None,
     retries: int = 2,
+    header_protocol: str = "openai",
 ) -> dict[str, Any]:
     url = build_api_url(config, path)
     data = None
-    headers = {
-        "Authorization": f"Bearer {config.api_key}",
-        "Content-Type": "application/json",
-    }
-    if extra_headers:
-        headers.update(extra_headers)
+    headers = _headers_for_protocol(config, header_protocol, extra_headers)
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -85,15 +164,8 @@ def preflight_check(config: ApiConfig, model: str) -> tuple[bool, str]:
     - message: 可用时为空，不可用时为错误信息
     """
     try:
-        # 使用极简的请求，超时设为 5 秒
-        temp_config = ApiConfig(
-            base_url=config.base_url,
-            api_key=config.api_key,
-            timeout=5,
-            max_tokens=10,
-            temperature=0,
-            api_style=config.api_style,
-        )
+        # 使用极简请求，但保留足够时间给慢中转；太短会把 6-8 秒的可用模型误判为不可用。
+        temp_config = lightweight_api_config(config, timeout=10, max_tokens=10)
 
         # 极简问题，只需要模型能响应即可
         system = "Reply with just 'ok'."
@@ -141,10 +213,7 @@ def chat_openai(config: ApiConfig, model: str, system: str, user: str, stream: b
     if stream:
         # Streaming mode: collect chunks
         url = build_api_url(config, "/chat/completions")
-        headers = {
-            "Authorization": f"Bearer {config.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = build_request_headers(config)
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
@@ -342,11 +411,7 @@ def chat_anthropic(
     if thinking:
         payload["thinking"] = _anthropic_thinking_payload(model, thinking)
     started = time.perf_counter()
-    # 同时保留 api_request 默认的 Bearer Authorization 与 Anthropic 官方 x-api-key。
-    headers = _anthropic_headers(config)
-    if extra_headers:
-        headers.update(extra_headers)
-    data = api_request(config, "POST", "/messages", payload, extra_headers=headers)
+    data = api_request(config, "POST", "/messages", payload, extra_headers=extra_headers, header_protocol="anthropic")
     latency_ms = int((time.perf_counter() - started) * 1000)
     content = data.get("content")
     if isinstance(content, list):
@@ -375,7 +440,7 @@ def chat_anthropic_full(
     if extra_payload:
         payload.update(extra_payload)
     started = time.perf_counter()
-    data = api_request(config, "POST", "/messages", payload, extra_headers=_anthropic_headers(config))
+    data = api_request(config, "POST", "/messages", payload, header_protocol="anthropic")
     latency_ms = int((time.perf_counter() - started) * 1000)
     content = data.get("content")
     if isinstance(content, list):
@@ -530,11 +595,11 @@ def chat_gemini(config: ApiConfig, model: str, system: str, user: str) -> tuple[
     # 先尝试标准方式（某些中转可能仍用 Authorization header）
     try:
         # 尝试在 URL 中传递 key
-        data = api_request(config, "POST", f"{endpoint}?key={config.api_key}", payload, extra_headers={"Content-Type": "application/json"})
+        data = api_request(config, "POST", f"{endpoint}?key={config.api_key}", payload, header_protocol="gemini-native")
     except Exception:
         # 如果失败，尝试 v1beta
         endpoint = f"/v1beta/models/{model}:generateContent"
-        data = api_request(config, "POST", f"{endpoint}?key={config.api_key}", payload, extra_headers={"Content-Type": "application/json"})
+        data = api_request(config, "POST", f"{endpoint}?key={config.api_key}", payload, header_protocol="gemini-native")
 
     latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -576,11 +641,7 @@ def _openai_chat_text(data: dict[str, Any]) -> str:
 
 
 def _anthropic_headers(config: ApiConfig) -> dict[str, str]:
-    return {
-        "x-api-key": config.api_key,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-    }
+    return build_anthropic_request_headers(config)
 
 
 def build_test_pdf(text: str) -> bytes:

@@ -18,8 +18,8 @@ try:
 except ImportError:  # curses 在标准 Windows Python 发行版上不可用
     curses = None  # type: ignore[assignment]
 
-from .api import chat, fetch_models
-from .models import ApiConfig, AuditConfig, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT, ProbeResult
+from .api import chat, fetch_models, lightweight_api_config
+from .models import ApiConfig, AuditConfig, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT, DEFAULT_USER_AGENT, ProbeResult
 from .pricing import build_run_estimate, format_run_estimate, format_usd
 from .probes import applicable_probes
 from .reporters import TuiReporter
@@ -29,6 +29,51 @@ from .utils import filter_models
 from .version import PROJECT_NAME, __version__, fetch_remote_version, is_newer_version
 
 
+USER_AGENT_PRESETS = [
+    ("No User-Agent", ""),
+    ("OpenAI Python SDK", DEFAULT_USER_AGENT),
+    ("OpenAI Node SDK", "OpenAI/NodeJS 4.0.0"),
+    ("curl", "curl/8.7.1"),
+    ("Chrome macOS", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    ("Safari macOS", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"),
+]
+
+
+def user_agent_choices(current: str) -> list[tuple[str, str]]:
+    choices = list(USER_AGENT_PRESETS)
+    current = current.strip()
+    if current and all(value != current for _label, value in choices):
+        choices.append(("Current custom", current))
+    return choices
+
+
+def user_agent_retry_choices(current: str) -> list[tuple[str, str]]:
+    choices = user_agent_choices(current)
+    current = current.strip()
+    current_choices = [
+        (label, value)
+        for label, value in choices
+        if value == current and current and current != DEFAULT_USER_AGENT
+    ]
+    priority_labels = {"No User-Agent", "curl", "Chrome macOS", "Safari macOS"}
+    priority_choices = [(label, value) for label, value in choices if label in priority_labels and (label, value) not in current_choices]
+    fallback_choices = [(label, value) for label, value in choices if (label, value) not in current_choices and (label, value) not in priority_choices]
+    return current_choices + priority_choices + fallback_choices
+
+
+def user_agent_display_value(value: str) -> str:
+    return value if value else "(none)"
+
+
+def should_retry_fetch_models_with_user_agent(error: str) -> bool:
+    text = error.lower()
+    if "client_restricted" in text or "current client" in text:
+        return True
+    if "403" not in text:
+        return False
+    return any(marker in text for marker in ("blocked", "waf", "cloudflare", "client"))
+
+
 def make_namespace_from_tui(state: dict[str, Any]) -> argparse.Namespace:
     limit_value = str(state["limit"]).strip()
     models_value = str(state["model"]).strip()
@@ -36,6 +81,7 @@ def make_namespace_from_tui(state: dict[str, Any]) -> argparse.Namespace:
     return argparse.Namespace(
         base_url=str(state["base_url"]).strip(),
         api_key=str(state["api_key"]).strip(),
+        user_agent=str(state.get("user_agent", DEFAULT_USER_AGENT)).strip(),
         models=models_value or None,
         model_filter=filter_value or None,
         limit=int(limit_value) if limit_value else None,
@@ -191,6 +237,7 @@ class TuiApp:
         self.state: dict[str, Any] = {
             "base_url": os.getenv("AI_RELAY_BASE_URL", ""),
             "api_key": os.getenv("AI_RELAY_API_KEY", ""),
+            "user_agent": os.getenv("AI_RELAY_USER_AGENT", DEFAULT_USER_AGENT),
             "model": "",
             "model_filter": "",
             "limit": "",
@@ -208,6 +255,7 @@ class TuiApp:
         self.fields: list[tuple[str, str]] = [
             ("base_url", "Base URL"),
             ("api_key", "API Key"),
+            ("user_agent", "User-Agent"),
             ("model", "Model"),
             ("model_filter", "Model filter"),
             ("limit", "Limit"),
@@ -225,6 +273,7 @@ class TuiApp:
         self.field_labels_zh = {
             "base_url": "中转站地址",
             "api_key": "API 密钥",
+            "user_agent": "客户端标识",
             "model": "模型",
             "model_filter": "模型筛选",
             "limit": "数量限制",
@@ -280,6 +329,10 @@ class TuiApp:
             "api_key": (
                 "Bearer API key used for /v1/models and /v1/chat/completions. It is masked on screen.",
                 "Enter the key. Then press F5 to pick a model, or fill Model manually.",
+            ),
+            "user_agent": (
+                "HTTP User-Agent sent to the relay for model and probe requests.",
+                "Press Enter to choose a preset, or select custom edit for a relay-specific identifier.",
             ),
             "model": (
                 "One model ID to audit. TUI intentionally tests one model per run.",
@@ -337,6 +390,7 @@ class TuiApp:
         self.help_text_zh: dict[str, tuple[str, str]] = {
             "base_url": ("中转站地址，例如 https://api.example.com 或 https://api.example.com/v1。", "填写地址后移动到 API 密钥。"),
             "api_key": ("用于 /v1/models 和模型调用的 Bearer API key，界面会打码显示。", "填写密钥后按 F5 选模型，或手动填写模型。"),
+            "user_agent": ("发送给中转站的 HTTP User-Agent。", "按 Enter 可选择预设；若站点有特殊要求，选择自定义编辑。"),
             "model": ("本次要检测的单个模型 ID。TUI 模式刻意保持一次只测一个模型。", "按 F5 拉取并选择模型，或手动填写；然后按 F9。"),
             "model_filter": ("拉取模型列表后应用的正则筛选。", "可填 (gpt|claude)，留空则显示全部模型。"),
             "limit": ("筛选后最多保留多少个模型，留空表示不限。", "模型列表很长时可先限制数量，再按 F5 选择。"),
@@ -493,9 +547,33 @@ class TuiApp:
             if not cfg.api.base_url or not cfg.api.api_key:
                 raise ValueError(self.text("Base URL and API Key are required before fetching models.", "获取模型列表前必须填写中转站地址和 API 密钥。"))
             reporter.section(self.text("Fetch model list", "获取模型列表"))
-            loaded_models = fetch_models(cfg.api)
+            loaded_models: list[str] | None = None
+            last_error: Exception | None = None
+            selected_user_agent_label = ""
+            selected_user_agent = cfg.api.user_agent
+            for attempt, (label, user_agent) in enumerate(user_agent_retry_choices(cfg.api.user_agent), 1):
+                try:
+                    attempt_api = dataclasses.replace(cfg.api, user_agent=user_agent)
+                    loaded_models = fetch_models(attempt_api)
+                    selected_user_agent_label = label
+                    selected_user_agent = user_agent
+                    self.state["user_agent"] = user_agent
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    if not should_retry_fetch_models_with_user_agent(str(exc)):
+                        raise
+                    continue
+            if loaded_models is None:
+                raise last_error if last_error is not None else RuntimeError("No models fetched")
             models = filter_models(loaded_models, cfg.model_filter, cfg.limit)
             self.fetched_models = models
+            reporter.info(
+                self.text(
+                    f"/v1/models succeeded with User-Agent: {selected_user_agent_label} {user_agent_display_value(selected_user_agent)}",
+                    f"/v1/models 使用客户端标识成功：{selected_user_agent_label} {user_agent_display_value(selected_user_agent)}",
+                )
+            )
             reporter.info(
                 self.text(
                     f"Loaded {len(loaded_models)} models; {len(models)} after filter/limit. Select one in the popup.",
@@ -545,11 +623,13 @@ class TuiApp:
             model = cfg.models[0]
             reporter.section("连接测试")
             try:
-                response, _usage, latency_ms = chat(cfg.api, model, "Reply with exactly OK.", "ping")
+                ping_api = lightweight_api_config(cfg.api)
+                response, _usage, latency_ms = chat(ping_api, model, "Reply with exactly OK.", "ping")
+                resolved_style = cfg.api.resolved_styles.get(model, cfg.api.api_style)
                 reporter.info(
                     self.text(
-                        f"Model call reachable via api_style={cfg.api.api_style}: {latency_ms} ms, response={response.strip()[:80]!r}",
-                        f"模型调用可达，api_style={cfg.api.api_style}：{latency_ms} ms，回复={response.strip()[:80]!r}",
+                        f"Model call reachable via api_style={resolved_style}: {latency_ms} ms, response={response.strip()[:80]!r}",
+                        f"模型调用可达，api_style={resolved_style}：{latency_ms} ms，回复={response.strip()[:80]!r}",
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -641,14 +721,17 @@ class TuiApp:
         return None
 
     def save_latest_report(self) -> None:
+        self.set_view("log")
         if self.last_saved_paths:
             md_path, json_path = self.last_saved_paths
             self.add_log(self.text("Report already saved.", "报告已保存过。"))
             self.add_log(f"Markdown: {md_path}")
             self.add_log(f"JSON: {json_path}")
+            self.set_log_bottom()
             return
         if not self.last_model_results or not self.last_report_config:
             self.add_log(self.text("No completed report is available to save yet.", "还没有可保存的已完成报告。"))
+            self.set_log_bottom()
             return
         output_dir = self.last_report_output_dir or str(self.state["output_dir"]).strip() or "reports"
         try:
@@ -658,14 +741,75 @@ class TuiApp:
             self.add_log(self.text("Suggestions:", "下一步建议："))
             for suggestion in suggest_next_steps(str(exc)):
                 self.add_log(f"  - {suggestion}")
+            self.set_log_bottom()
             return
         self.last_saved_paths = (md_path, json_path)
         self.last_report_unsaved = False
         self.add_log(self.text("Report saved", "报告已保存"))
         self.add_log(f"Markdown: {md_path}")
         self.add_log(f"JSON: {json_path}")
+        self.set_log_bottom()
 
     # ---- popups ---------------------------------------------------------
+
+    def select_user_agent_popup(self) -> bool:
+        choices = user_agent_choices(str(self.state.get("user_agent", "")))
+        height, width = self.stdscr.getmaxyx()
+        title = self.text("Select User-Agent", "选择客户端标识")
+        win_height = min(max(10, len(choices) + 6), max(7, height - 4))
+        win_width = min(max(70, max((display_width(label) + display_width(value) + 8 for label, value in choices), default=0)), max(30, width - 4))
+        y = max(1, (height - win_height) // 2)
+        x = max(0, (width - win_width) // 2)
+        win = curses.newwin(win_height, win_width, y, x)
+        win.keypad(True)
+        current = str(self.state.get("user_agent", "")).strip()
+        selected = next((idx for idx, (_label, value) in enumerate(choices) if value == current), 0)
+        offset = 0
+        while True:
+            win.erase()
+            with contextlib.suppress(curses.error):
+                win.border()
+            self._safe_addstr(win, 1, 2, title, curses.A_BOLD)
+            visible = win_height - 5
+            if selected < offset:
+                offset = selected
+            if selected >= offset + visible:
+                offset = selected - visible + 1
+            offset = min(offset, max(0, len(choices) - visible))
+            value_width = max(10, win_width - 24)
+            for row, (label, value) in enumerate(choices[offset : offset + visible]):
+                idx = offset + row
+                attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
+                line = f"{label}: {user_agent_display_value(value)}"
+                if display_width(line) > value_width:
+                    line = truncate_display(line, value_width - 1) + "~"
+                self._safe_addstr(win, 3 + row, 2, line, attr)
+            self._safe_addstr(
+                win,
+                win_height - 2,
+                2,
+                self.text("Enter choose | e custom edit | Esc cancel", "Enter 选择 | e 自定义编辑 | Esc 取消"),
+            )
+            win.refresh()
+            ch = win.getch()
+            if ch in (10, 13):
+                label, value = choices[selected]
+                self.state["user_agent"] = value
+                self.add_log(self.text(f"User-Agent selected: {label}", f"已选择客户端标识：{label}"))
+                return True
+            if ch == 27:
+                self.add_log(self.text("User-Agent selection cancelled.", "已取消客户端标识选择。"))
+                return True
+            if ch in (ord("e"), ord("E")):
+                return False
+            if ch == curses.KEY_UP:
+                selected = max(0, selected - 1)
+            elif ch == curses.KEY_DOWN:
+                selected = min(len(choices) - 1, selected + 1)
+            elif ch == curses.KEY_NPAGE:
+                selected = min(len(choices) - 1, selected + visible)
+            elif ch == curses.KEY_PPAGE:
+                selected = max(0, selected - visible)
 
     def confirm_run_popup(self) -> bool:
         cfg = AuditConfig.from_namespace(make_namespace_from_tui(self.state))
@@ -743,6 +887,8 @@ class TuiApp:
     def edit_field(self, key: str, label: str) -> None:
         if isinstance(self.state[key], bool):
             self.state[key] = not self.state[key]
+            return
+        if key == "user_agent" and self.select_user_agent_popup():
             return
         if key == "api_style":
             styles = ["auto", "openai-responses", "openai-chat", "anthropic", "gemini"]

@@ -335,8 +335,14 @@ def suggest_next_steps(error: str, context: dict[str, Any] | None = None) -> lis
     suggestions: list[str] = []
     if "base-url" in text or "base url" in text:
         suggestions.append("填写 Base URL；可带或不带 /v1。")
+    if "client_restricted" in text or "current client" in text or ("403" in text and "blocked" in text):
+        suggestions.append("中转站限制或拦截了当前客户端标识；在 TUI 的客户端标识字段选择 Chrome/Safari/curl 等 User-Agent，或用 AI_RELAY_USER_AGENT/--user-agent 指定。")
+    if "403" in text and "blocked" in text:
+        suggestions.append("如果只是 F5 获取模型列表失败，可在 Model 字段手动填写已知模型 ID 后直接按 F9；F5 不是运行检测的必需步骤。")
     if "api key" in text or "401" in text or "403" in text or "authorization" in text:
         suggestions.append("检查 API key、账户额度/权限，以及中转站是否接受 Bearer Authorization。")
+    if ("upstream" in text and "403" in text) or ("上游渠道" in text and "403" in text):
+        suggestions.append("上游渠道返回 403：通常是该模型所在渠道无权限、无额度、被地区/客户端策略限制，或模型列表包含但实际路由不可用；可先换同站其他模型或指定 openai-chat 复测。")
     if "http 404" in text:
         suggestions.append("检查 Base URL 是否正确；若模型调用失败，尝试切换 API style。")
     if "429" in text:

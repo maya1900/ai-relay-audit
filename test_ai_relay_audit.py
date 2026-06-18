@@ -14,8 +14,10 @@ import contextlib
 import io
 import json
 import os
+import queue
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 import ai_relay_audit as m
@@ -141,6 +143,108 @@ class ApiRequestTest(unittest.TestCase):
         self.assertEqual(requests[0].full_url, "https://relay.example.com/v1/models")
         self.assertEqual(requests[1].full_url, "https://relay.example.com/v1/models/gemini:generateContent?key=sk-test")
 
+    def test_api_request_default_headers_avoid_urllib_fingerprint(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({"data": []})
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            m.api_request(make_config(), "GET", "/models")
+
+        headers = {k.lower(): v for k, v in requests[0].header_items()}
+        self.assertEqual(headers["authorization"], "Bearer sk-test")
+        self.assertEqual(headers["accept"], "application/json")
+        self.assertEqual(headers["user-agent"], m.DEFAULT_USER_AGENT)
+        self.assertEqual(headers["x-stainless-lang"], "python")
+        self.assertEqual(headers["x-stainless-package-version"], m.DEFAULT_OPENAI_SDK_VERSION)
+        self.assertNotIn("Python-urllib", headers["user-agent"])
+        self.assertNotIn("ai-relay-audit", headers["user-agent"])
+
+    def test_api_request_allows_custom_user_agent(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({"data": []})
+
+        config = make_config()
+        config.user_agent = "AllowedClient/1.0"
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            m.api_request(config, "GET", "/models")
+
+        headers = {k.lower(): v for k, v in requests[0].header_items()}
+        self.assertEqual(headers["user-agent"], "AllowedClient/1.0")
+        self.assertNotIn("x-stainless-lang", headers)
+
+    def test_api_request_allows_no_user_agent(self) -> None:
+        requests = []
+
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            requests.append(request)
+            return FakeHTTPResponse({"data": []})
+
+        config = make_config()
+        config.user_agent = ""
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            m.api_request(config, "GET", "/models")
+
+        headers = {k.lower(): v for k, v in requests[0].header_items()}
+        self.assertEqual(headers["authorization"], "Bearer sk-test")
+        self.assertNotIn("user-agent", headers)
+        self.assertNotIn("x-stainless-lang", headers)
+
+    def test_lightweight_api_config_preserves_identity_and_reduces_budget(self) -> None:
+        config = make_config()
+        config.timeout = 90
+        config.max_tokens = 900
+        config.temperature = 0.7
+        config.api_style = "auto"
+        config.user_agent = "AllowedClient/1.0"
+        config.resolved_styles["claude-opus"] = "openai-chat"
+
+        ping_config = m.lightweight_api_config(config, timeout=5, max_tokens=10)
+
+        self.assertEqual(ping_config.timeout, 5)
+        self.assertEqual(ping_config.max_tokens, 10)
+        self.assertEqual(ping_config.temperature, 0.0)
+        self.assertEqual(ping_config.api_style, "auto")
+        self.assertEqual(ping_config.user_agent, "AllowedClient/1.0")
+        self.assertIs(ping_config.resolved_styles, config.resolved_styles)
+
+    def test_preflight_check_uses_ten_second_timeout_for_slow_relays(self) -> None:
+        seen_configs: list[m.ApiConfig] = []
+
+        def fake_chat(config: m.ApiConfig, model: str, system: str, user: str) -> tuple[str, dict[str, object], int]:
+            seen_configs.append(config)
+            return "ok", {}, 6300
+
+        with mock.patch("relay_audit.api.chat", fake_chat):
+            ok, message = m.preflight_check(make_config(), "gpt-4o")
+
+        self.assertTrue(ok, message)
+        self.assertEqual(seen_configs[0].timeout, 10)
+
+    def test_api_request_http_error_redacts_api_key(self) -> None:
+        def fake_urlopen(request: object, timeout: int) -> FakeHTTPResponse:
+            raise urllib.error.HTTPError(
+                url="https://relay.example.com/v1/models",
+                code=401,
+                msg="Unauthorized",
+                hdrs=None,
+                fp=io.BytesIO(b'{"error":"invalid key sk-supersecret"}'),
+            )
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(RuntimeError) as raised:
+                m.api_request(make_config(api_key="sk-supersecret"), "GET", "/models", retries=0)
+
+        error = str(raised.exception)
+        self.assertIn("HTTP 401", error)
+        self.assertIn("***REDACTED***", error)
+        self.assertNotIn("sk-supersecret", error)
+
     def test_chat_openai_payload(self) -> None:
         requests = []
 
@@ -163,6 +267,7 @@ class ApiRequestTest(unittest.TestCase):
         self.assertEqual(payload["max_tokens"], 900)
         self.assertEqual(payload["temperature"], 0.0)
         self.assertEqual(headers["authorization"], "Bearer sk-test")
+        self.assertEqual(headers["user-agent"], m.DEFAULT_USER_AGENT)
 
     def test_chat_openai_responses_payload(self) -> None:
         requests = []
@@ -199,11 +304,14 @@ class ApiRequestTest(unittest.TestCase):
             text, usage, _latency = m.chat_gemini(make_config(), "gemini-2.0-flash", "sys", "user")
 
         payload = request_json(requests[0])
+        headers = {k.lower(): v for k, v in requests[0].header_items()}
         self.assertEqual(text, "ok")
         self.assertEqual(usage["total_tokens"], 2)
         self.assertEqual(requests[0].full_url, "https://relay.example.com/v1/models/gemini-2.0-flash:generateContent?key=sk-test")
         self.assertEqual(payload["contents"][0]["parts"][0]["text"], "user")
         self.assertEqual(payload["systemInstruction"]["parts"][0]["text"], "sys")
+        self.assertNotIn("authorization", headers)
+        self.assertNotIn("x-stainless-lang", headers)
 
     def test_chat_anthropic_payload_and_headers(self) -> None:
         requests = []
@@ -225,7 +333,9 @@ class ApiRequestTest(unittest.TestCase):
         self.assertEqual(requests[0].full_url, "https://relay.example.com/v1/messages")
         self.assertEqual(payload["temperature"], 0.0)
         self.assertEqual(headers["x-api-key"], "sk-test")
-        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+        self.assertEqual(headers["anthropic-version"], m.ANTHROPIC_VERSION)
+        self.assertNotIn("authorization", headers)
+        self.assertNotIn("x-stainless-lang", headers)
 
     def test_anthropic_thinking_uses_adaptive_for_opus_47(self) -> None:
         requests = []
@@ -1158,6 +1268,7 @@ class TuiSaveTest(unittest.TestCase):
         app.language = "zh"
         app.logs = []
         app.log_scroll = 0
+        app.view_mode = "report"
         app.last_saved_paths = None
         app.last_model_results = {"gpt-4o": [make_result(score=90)]}
         app.last_report_config = make_config()
@@ -1170,13 +1281,16 @@ class TuiSaveTest(unittest.TestCase):
         write_reports.assert_called_once()
         self.assertEqual(app.last_saved_paths, ("new.md", "new.json"))
         self.assertFalse(app.last_report_unsaved)
+        self.assertEqual(app.view_mode, "log")
+        self.assertEqual(app.log_scroll, 0)
         self.assertIn("报告已保存", app.logs)
 
     def test_save_latest_report_does_not_write_again_when_already_saved(self) -> None:
         app = m.TuiApp.__new__(m.TuiApp)
         app.language = "zh"
         app.logs = []
-        app.log_scroll = 0
+        app.log_scroll = 5
+        app.view_mode = "report"
         app.last_saved_paths = ("old.md", "old.json")
         app.last_model_results = {"gpt-4o": [make_result(score=90)]}
         app.last_report_config = make_config()
@@ -1188,6 +1302,8 @@ class TuiSaveTest(unittest.TestCase):
 
         self.assertIn("报告已保存过。", app.logs)
         self.assertIn("Markdown: old.md", app.logs)
+        self.assertEqual(app.view_mode, "log")
+        self.assertEqual(app.log_scroll, 0)
 
 
 class VersionTest(unittest.TestCase):
@@ -1222,6 +1338,34 @@ class VersionTest(unittest.TestCase):
 
 
 class TuiKeyTest(unittest.TestCase):
+    def test_user_agent_choices_include_presets_and_current_custom(self) -> None:
+        choices = m.user_agent_choices("AllowedClient/1.0")
+
+        self.assertIn(("No User-Agent", ""), choices)
+        self.assertIn(("OpenAI Python SDK", m.DEFAULT_USER_AGENT), choices)
+        self.assertIn(("Current custom", "AllowedClient/1.0"), choices)
+
+    def test_user_agent_choices_do_not_duplicate_existing_preset(self) -> None:
+        choices = m.user_agent_choices(m.DEFAULT_USER_AGENT)
+
+        self.assertEqual([value for _label, value in choices].count(m.DEFAULT_USER_AGENT), 1)
+
+    def test_user_agent_retry_choices_try_custom_current_first(self) -> None:
+        choices = m.user_agent_retry_choices("AllowedClient/1.0")
+
+        self.assertEqual(choices[0], ("Current custom", "AllowedClient/1.0"))
+        self.assertIn(("OpenAI Python SDK", m.DEFAULT_USER_AGENT), choices[1:])
+
+    def test_user_agent_retry_choices_try_no_user_agent_before_default(self) -> None:
+        choices = m.user_agent_retry_choices(m.DEFAULT_USER_AGENT)
+
+        self.assertEqual(choices[0], ("No User-Agent", ""))
+        self.assertIn(("OpenAI Python SDK", m.DEFAULT_USER_AGENT), choices[1:])
+
+    def test_should_retry_fetch_models_with_user_agent_for_blocked_403(self) -> None:
+        self.assertTrue(m.should_retry_fetch_models_with_user_agent("HTTP 403: Your request was blocked."))
+        self.assertFalse(m.should_retry_fetch_models_with_user_agent("HTTP 401: invalid token"))
+
     def test_x_clears_live_logs_only(self) -> None:
         app = m.TuiApp.__new__(m.TuiApp)
         app.logs = ["one", "two"]
@@ -1300,6 +1444,81 @@ class TuiKeyTest(unittest.TestCase):
         with mock.patch.object(m.curses, "newwin", return_value=FakeWin()):
             self.assertTrue(app.confirm_run_popup())
 
+    def test_fetch_models_worker_quietly_prefers_no_user_agent(self) -> None:
+        app = m.TuiApp.__new__(m.TuiApp)
+        app.language = "zh"
+        app.queue = queue.Queue()
+        app.fetched_models = []
+        app.state = {
+            "base_url": "https://relay.example.com",
+            "api_key": "sk-test",
+            "user_agent": m.DEFAULT_USER_AGENT,
+            "model": "",
+            "model_filter": "",
+            "limit": "",
+            "timeout": "30",
+            "max_tokens": "900",
+            "temperature": "0",
+            "api_style": "auto",
+            "mode": "standard",
+            "long_context": "off",
+            "output_dir": "reports",
+            "save_report": False,
+            "all_targeted": False,
+            "hide_prompts": False,
+        }
+        seen_user_agents: list[str] = []
+
+        def fake_fetch_models(config: m.ApiConfig) -> list[str]:
+            seen_user_agents.append(config.user_agent)
+            return ["gpt-4o"]
+
+        with mock.patch("relay_audit.tui.fetch_models", fake_fetch_models):
+            app.fetch_models_worker()
+
+        self.assertEqual(app.fetched_models, ["gpt-4o"])
+        self.assertEqual(seen_user_agents, [""])
+        self.assertEqual(app.state["user_agent"], "")
+        queued = []
+        while not app.queue.empty():
+            queued.append(app.queue.get_nowait())
+        self.assertIn("__SELECT_MODEL__", queued)
+        self.assertFalse(any("重试" in str(item) for item in queued))
+
+    def test_fetch_models_worker_tries_current_successful_user_agent_first(self) -> None:
+        app = m.TuiApp.__new__(m.TuiApp)
+        app.language = "zh"
+        app.queue = queue.Queue()
+        app.fetched_models = []
+        app.state = {
+            "base_url": "https://relay.example.com",
+            "api_key": "sk-test",
+            "user_agent": "curl/8.7.1",
+            "model": "",
+            "model_filter": "",
+            "limit": "",
+            "timeout": "30",
+            "max_tokens": "900",
+            "temperature": "0",
+            "api_style": "auto",
+            "mode": "standard",
+            "long_context": "off",
+            "output_dir": "reports",
+            "save_report": False,
+            "all_targeted": False,
+            "hide_prompts": False,
+        }
+        seen_user_agents: list[str] = []
+
+        def fake_fetch_models(config: m.ApiConfig) -> list[str]:
+            seen_user_agents.append(config.user_agent)
+            return ["gpt-4o"]
+
+        with mock.patch("relay_audit.tui.fetch_models", fake_fetch_models):
+            app.fetch_models_worker()
+
+        self.assertEqual(seen_user_agents, ["curl/8.7.1"])
+
 
 class ErrorSuggestionTest(unittest.TestCase):
     def test_auth_error(self) -> None:
@@ -1313,6 +1532,12 @@ class ErrorSuggestionTest(unittest.TestCase):
     def test_no_models(self) -> None:
         suggestions = m.suggest_next_steps("No models to audit.")
         self.assertTrue(any("Model filter" in item for item in suggestions))
+
+    def test_blocked_403_suggests_user_agent_and_manual_model(self) -> None:
+        suggestions = m.suggest_next_steps("HTTP 403: Your request was blocked.")
+        joined = "\n".join(suggestions)
+        self.assertIn("User-Agent", joined)
+        self.assertIn("手动填写", joined)
 
 
 class DotenvTest(unittest.TestCase):

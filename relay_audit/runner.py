@@ -8,7 +8,7 @@ import sys
 from typing import Any, Callable
 
 from .api import fetch_models, preflight_check
-from .models import ApiConfig, AuditConfig, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT, ProbeResult
+from .models import ApiConfig, AuditConfig, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT, DEFAULT_USER_AGENT, ProbeResult
 from .pricing import build_run_estimate, format_run_estimate
 from .probe_runner import run_probe
 from .probes import audit_probes_for_model, configured_probes
@@ -50,6 +50,7 @@ PROVIDER_KEY_ENV = {
 def add_common_audit_args(parser: argparse.ArgumentParser, require_models: bool = True) -> None:
     parser.add_argument("--base-url", default=os.getenv("AI_RELAY_BASE_URL", ""), help="Relay base URL. May include /v1.")
     parser.add_argument("--api-key", default=os.getenv("AI_RELAY_API_KEY", ""), help="Relay API key.")
+    parser.add_argument("--user-agent", default=os.getenv("AI_RELAY_USER_AGENT", DEFAULT_USER_AGENT), help=f"HTTP User-Agent sent to the relay. Default: {DEFAULT_USER_AGENT}.")
     parser.add_argument("--models", required=require_models, help="Comma-separated model IDs.")
     parser.add_argument("--model-filter", help="Regex filter applied to model IDs.")
     parser.add_argument("--limit", type=int, help="Maximum number of models after filtering.")
@@ -81,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     models_cmd = subparsers.add_parser("models", help="Fetch and print models from a relay.")
     models_cmd.add_argument("--base-url", default=os.getenv("AI_RELAY_BASE_URL", ""), help="Relay base URL. May include /v1.")
     models_cmd.add_argument("--api-key", default=os.getenv("AI_RELAY_API_KEY", ""), help="Relay API key.")
+    models_cmd.add_argument("--user-agent", default=os.getenv("AI_RELAY_USER_AGENT", DEFAULT_USER_AGENT), help=f"HTTP User-Agent sent to the relay. Default: {DEFAULT_USER_AGENT}.")
     models_cmd.add_argument("--model-filter", help="Regex filter applied to fetched model IDs.")
     models_cmd.add_argument("--limit", type=int, help="Maximum number of models after filtering.")
     models_cmd.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Request timeout seconds. Default: {DEFAULT_TIMEOUT}.")
@@ -149,6 +151,7 @@ def baseline_config_from_args(args: argparse.Namespace) -> AuditConfig:
         max_tokens=int(args.max_tokens),
         temperature=float(args.temperature),
         api_style=api_style,
+        user_agent=getattr(args, "user_agent", os.getenv("AI_RELAY_USER_AGENT", DEFAULT_USER_AGENT)) or DEFAULT_USER_AGENT,
     )
     return AuditConfig(
         api=api,
