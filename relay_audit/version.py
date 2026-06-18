@@ -7,7 +7,7 @@ import urllib.request
 
 
 PROJECT_NAME = "ai-relay-audit"
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 DEFAULT_REMOTE_VERSION_URL = (
     "https://raw.githubusercontent.com/maya1900/ai-relay-audit/master/relay_audit/version.py"
